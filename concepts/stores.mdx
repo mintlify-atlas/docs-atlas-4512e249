@@ -1,0 +1,200 @@
+---
+title: "Storage Backends in ThrottleKit"
+sidebarTitle: "Stores"
+description: "Stores expose one atomic apply primitive. Learn MemoryStore, RedisStore, Postgres, DynamoDB, bit-identical conformance across six backends, and fail modes."
+---
+
+A store's entire job is to run a pure read-modify-write transform **atomically per key** and persist the result with a TTL when asked. That single contract — one atomic primitive — is what makes ThrottleKit's N algorithms × M backends matrix collapse to N + M: algorithms are pure functions of state, backends are pure transport for one atomic read-modify-write, and no backend ever contains rate-limiting math.
+
+## The Store interface
+
+```ts
+interface Store {
+  /** Run `transform` atomically with respect to other applies on the same key. */
+  apply<S, R>(key: string, transform: Transform<S, R>): Promise<R>;
+
+  /**
+   * Synchronous variant for stores that guarantee atomicity without awaiting.
+   * Absent on async-only stores (e.g. Redis).
+   */
+  applySync?<S, R>(key: string, transform: Transform<S, R>, now?: number): R;
+
+  /** Forget a key. */
+  reset(key: string): Promise<void>;
+
+  /** Synchronous reset, when supported. */
+  resetSync?(key: string): void;
+
+  /** Release resources (timers, connections). */
+  close?(): Promise<void>;
+}
+```
+
+`apply` receives a `Transform` — a pure function `(state: S | undefined) => ApplyOutcome<S, R>` that may optionally carry a `.lua` rider for Lua-capable stores. The store runs the transform atomically. If the transform carries a Lua rider and the store is Lua-capable (Redis), it executes via `EVALSHA` in a single round trip. Every other store ignores the rider and runs the JavaScript function body — correctness never depends on the Lua path existing.
+
+<Note>
+  Adding a new backend is implementing one method: `apply`. Adding a new algorithm never touches a store. This orthogonality is the central design lever.
+</Note>
+
+## MemoryStore — the default
+
+`MemoryStore` is the default store when none is provided to `rateLimit`. It is exact, single-process, and supports the synchronous fast path.
+
+```ts
+import { MemoryStore } from "throttlekit";
+
+const store = new MemoryStore({
+  clock?: Clock,            // injectable time source (defaults to systemClock)
+  maxKeys?: number,         // cap key cardinality to bound memory
+  sweepIntervalMs?: number, // background expiry sweep interval (0 to disable)
+});
+```
+
+**Atomicity is free.** Node.js is single-threaded, so a synchronous read → transform → write cannot interleave. `applySync` needs no locks at all. The async `apply` simply wraps `applySync`.
+
+**O(1)-amortized expiry.** Keys are bucketed into slots by expiry tick via a hierarchical timing wheel. Advancing the wheel processes only the slots that have come due, so expiry costs O(due keys), not O(all keys). The sweep timer is `unref`'d and can be disabled for edge runtimes.
+
+**Adversarial-key-flood defense.** With `maxKeys` set, cardinality is bounded by an approximate CLOCK/second-chance ring — O(1) and reorder-free while bounding memory against a flood of unique (e.g. spoofed-IP) keys.
+
+**No serialization.** State is stored as native objects and numbers — zero JSON overhead on the hottest path.
+
+```ts
+import { rateLimit, gcra, MemoryStore } from "throttlekit";
+
+const store = new MemoryStore({ maxKeys: 100_000 });
+const limiter = rateLimit({ strategy: gcra({ limit: 100, periodMs: 60_000 }), store });
+
+// checkSync is available only with MemoryStore (or another sync-capable store)
+const d = limiter.checkSync("user-42");
+```
+
+## RedisStore — distributed, atomic
+
+`RedisStore` runs each check as a single atomic `EVALSHA` Lua script — one round trip to Redis, no read-modify-write race, no `WATCH`/`MULTI` retry storms on hot keys.
+
+```ts
+import Redis from "ioredis";
+import { RedisStore } from "throttlekit/redis";
+
+const store = new RedisStore({
+  client,          // ioredis, node-redis, or Upstash REST client
+  prefix?: string, // key prefix to namespace one Redis across many limiters
+  useLua?: boolean, // default true; set false to force OCC for all strategies
+  maxRetries?: number, // OCC retry limit (default 3)
+});
+```
+
+**Two atomicity paths:**
+
+- **Lua `EVALSHA` (built-in strategies)**: When the transform carries a `.lua` rider, `apply` runs the script via `EVALSHA`. A `NOSCRIPT` error (cache flushed by restart/failover) triggers an `EVAL` + re-cache fallback.
+- **Optimistic concurrency (custom strategies)**: Without a Lua form, the store falls back to `WATCH`/`GET`/`MULTI`/`EXEC` with bounded retries — correct for any user-authored pure strategy without requiring Lua.
+
+**Server clock as authority.** `RedisStore` derives `now` from the Redis server clock (`redis.call('TIME')`) by default, so node clock skew cannot corrupt shared state. Multiple app nodes writing to the same key see one authoritative time.
+
+**Redis Cluster support.** Keys are hash-tagged so multi-key scripts (multi-dimensional checks) co-locate on one slot; independent keys distribute across shards normally.
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+import Redis from "ioredis";
+
+const store = new RedisStore({ client: new Redis(process.env.REDIS_URL), prefix: "tk" });
+const limiter = rateLimit({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000, burst: 100 }),
+  store,
+  prefix: "api",
+});
+
+const d = await limiter.check("user-42"); // one EVALSHA, fully atomic
+```
+
+## Other distributed backends
+
+All distributed stores run the same pure JavaScript transform — there is no per-backend algorithm to keep in sync — and all encode state as JSON text for cross-backend bit-identity.
+
+| Backend | Subpath | Atomicity mechanism |
+|---|---|---|
+| In-memory | *(built-in)* | Single-threaded synchronous RMW |
+| Redis | `throttlekit/redis` | `EVALSHA` Lua (built-ins) / `WATCH`-`MULTI` OCC (custom) |
+| Postgres | `throttlekit/postgres` | `pg_advisory_xact_lock` + `INSERT … ON CONFLICT` upsert |
+| DynamoDB | `throttlekit/dynamodb` | Conditional `PutItem` CAS on a `version` attribute |
+| Deno KV | `throttlekit/deno` | `atomic().check(versionstamp).commit()` |
+| Cloudflare Durable Object | `throttlekit/cloudflare` | `blockConcurrencyWhile` actor serialization |
+| Cloudflare D1 | `throttlekit/cloudflare` | Version CAS via conditional `UPDATE … WHERE version = ?` |
+
+<Warning>
+  **Cloudflare Workers KV is the one approximate store.** Workers KV is eventually consistent with no atomic compare-and-set, so concurrent checks can interleave and over-admit under load. Use it only where occasional over-admission is acceptable. For exactness on Cloudflare, use the Durable Object or D1 backend instead.
+</Warning>
+
+## Conformance guarantees — proven bit-identical across 6 backends
+
+Every shipped store is verified through the same conformance suite (`runStoreConformance`), which asserts five properties:
+
+1. **Persists and mutates** — the transform's new state is committed.
+2. **Isolates independent keys** — applying to key `A` never affects key `B`.
+3. **`reset` clears** — after `reset(key)`, the next apply sees `undefined` state.
+4. **Expires after TTL** — keys are logically expired after their TTL passes.
+5. **Applies atomically** — **200 concurrent applies on one key read back exactly 200.** A non-atomic RMW would interleave and lose writes; an atomic store always lands exactly N.
+
+The dual-path conformance suite then runs thousands of generated `(arrivals, costs, clock)` timelines through both the JavaScript path and the Redis-Lua path and asserts that every decision in the stream is **byte-identical**. This is the proof behind the claim that developing in-memory and deploying on Redis produces no behavioral difference.
+
+## Failure modes: fail-open vs fail-closed
+
+When a distributed store is unreachable, `apply` rejects with a `StoreUnavailableError`. What happens next is determined by your explicit `fail` policy — there is no implicit default behavior.
+
+```ts
+type FailMode = "open" | "closed";
+```
+
+- **`fail: "open"`** — admit the request when the store is unreachable. Use for availability-critical paths where occasional over-admission during an outage is preferable to rejecting legitimate traffic.
+- **`fail: "closed"`** — reject the request when the store is unreachable. Use for security-critical limits where over-admission during an outage is unacceptable.
+
+The `fail` mode is configured at the adapter layer (e.g. `expressRateLimit`, `withRateLimit`), not on the store itself. A `twoTier(leased)` limiter keeps serving local credits through a brief L2 outage — the local credit pool acts as a natural buffer.
+
+```ts
+import { expressRateLimit } from "throttlekit/express";
+import { gcra } from "throttlekit";
+
+app.use(expressRateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  fail: "open",   // admit if Redis is down
+  store,
+}));
+```
+
+<Info>
+  Security-critical limits (authentication endpoints, payment flows) should use `fail: "closed"`. Availability-critical limits (general API access) should use `fail: "open"`. The library never guesses — both directions require an explicit choice.
+</Info>
+
+## Implementing a custom store
+
+Implement the `Store` interface against any backend with atomic semantics — Memcached (CAS), custom in-memory structures, or any database with conditional writes:
+
+```ts
+import type { Store, Transform } from "throttlekit";
+
+class MyStore implements Store {
+  async apply<S, R>(key: string, transform: Transform<S, R>): Promise<R> {
+    // Run transform atomically — read current state, apply transform, write new state.
+    // The transform may carry a .lua rider; if your store is Lua-capable, run it.
+    // Otherwise run the function body.
+  }
+
+  async reset(key: string): Promise<void> {
+    // Delete the key.
+  }
+
+  async close(): Promise<void> {
+    // Release any resources.
+  }
+}
+```
+
+Validate your store with the conformance kit:
+
+```ts
+import { runStoreConformance } from "throttlekit/testkit";
+
+// Runs the full atomicity, TTL, isolation, and persistence suite
+await runStoreConformance(() => new MyStore());
+```

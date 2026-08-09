@@ -1,0 +1,138 @@
+---
+title: "Postgres Store"
+sidebarTitle: "Postgres"
+description: "Distributed, exact rate limiting over PostgreSQL — per-key advisory-lock transactions, no Redis required, durable across restarts."
+---
+
+`PostgresStore` gives you exact, distributed rate limiting using your existing PostgreSQL database — no Redis, no extra infrastructure. Each `apply` call runs the limiter's pure JavaScript transform inside a transaction serialized per key by a **transaction-scoped advisory lock**. This makes N concurrent checks from any number of processes land exactly N decrements, identical to what Redis's atomic `EVALSHA` guarantees.
+
+## How it works
+
+```
+BEGIN
+SELECT pg_advisory_xact_lock(hashtextextended(key, 0))  -- per-key critical section
+SELECT state WHERE key = $1 AND expires_at > now         -- lazy expiry on read
+<run transform(state) in JavaScript>
+INSERT … ON CONFLICT (key) DO UPDATE                     -- persist if requested
+COMMIT                                                   -- releases the advisory lock
+```
+
+An advisory lock — rather than `SELECT … FOR UPDATE` — is used deliberately: `FOR UPDATE` cannot lock a row that does not yet exist, so two first-touch transactions on a new key could race. An advisory lock keyed by the hash of the key serializes them whether or not the row exists, and auto-releases at `COMMIT` or `ROLLBACK` so an error can never leak a held lock.
+
+State is stored as JSON text, identical to what the Redis optimistic-concurrency path writes. A value round-trips as the exact IEEE-754 double, keeping decisions bit-identical across all backends.
+
+## Installation
+
+`PostgresStore` is exported from the `throttlekit/postgres` subpath. You also need the `pg` (node-postgres) package as a peer dependency.
+
+```bash
+npm install throttlekit pg
+npm install --save-dev @types/pg   # if using TypeScript
+```
+
+## Quick example
+
+```ts
+import { Pool } from "pg";
+import { rateLimit, gcra } from "throttlekit";
+import { PostgresStore } from "throttlekit/postgres";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// The store auto-creates its table on first use. `prefix` namespaces keys so
+// one table can back many limiters without key collisions.
+const store = new PostgresStore({ pool, prefix: "api" });
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000, burst: 100 }),
+  store,
+});
+
+const key = "user-42";
+await limiter.reset(key); // start clean for a repeatable demo
+
+const a = await limiter.check(key);
+console.log("allowed:", a.allowed, "remaining:", a.remaining, "limit:", a.limit);
+
+// Spend a larger cost in one atomic transaction
+const b = await limiter.check(key, 10);
+console.log("cost-10 allowed:", b.allowed, "remaining:", b.remaining);
+
+await store.close(); // stops the background sweep timer
+await pool.end();
+```
+
+## Schema
+
+When `autoCreate: true` (the default), the store runs these statements on first use — no manual migration required:
+
+```sql
+CREATE TABLE IF NOT EXISTS throttlekit (
+  key        TEXT    PRIMARY KEY,
+  state      TEXT    NOT NULL,
+  expires_at BIGINT  NOT NULL
+);
+CREATE INDEX IF NOT EXISTS throttlekit_expires_idx ON throttlekit (expires_at);
+```
+
+You can change the table name with the `table` option. Both `schema.table` and bare `table` identifiers are accepted.
+
+## Options
+
+<ParamField path="pool" type="PgPoolLike" required>
+  A `pg.Pool` (or any compatible object with `connect()` and `query()` methods).
+  ThrottleKit never ends a pool it does not own — call `pool.end()` yourself
+  when your application shuts down.
+</ParamField>
+
+<ParamField path="table" type="string" default='"throttlekit"'>
+  Unquoted table identifier for the limiter state table. Validated against
+  `^[A-Za-z_][A-Za-z0-9_]*$` (optionally `schema.table`) since identifiers
+  cannot be parameterized. Change this if you want to share a schema with other
+  application tables.
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Storage key namespace. Keys are stored as `prefix:key`. Use this to share
+  one table across multiple limiters without key collisions.
+</ParamField>
+
+<ParamField path="autoCreate" type="boolean" default="true">
+  Create the table and its expiry index on first use. Set `false` when you
+  manage migrations externally (e.g. with Flyway, Liquibase, or a custom SQL
+  migration script) and want ThrottleKit to assume the table already exists.
+</ParamField>
+
+<ParamField path="sweepIntervalMs" type="number" default="60000">
+  Interval in milliseconds for the background sweep that deletes rows whose
+  `expires_at` has passed. Set `0` to disable the sweep entirely and rely on
+  lazy expiry only — expired rows are already invisible to reads and do not
+  affect correctness; the sweep only reclaims storage.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Time source for expiry decisions. Defaults to the system clock. Inject a
+  `ManualClock` to drive expiry deterministically in tests.
+</ParamField>
+
+## When to use
+
+PostgresStore is a good fit when:
+
+- Your stack **already runs Postgres** and you want to avoid adding Redis.
+- You need **durable counters** that survive both application and database restarts.
+- You are running on a **managed Postgres service** (RDS, Cloud SQL, Supabase, Neon) and want to keep the architecture simple.
+- Your rate limits are **billing-critical** or **abuse-critical** and you need the persistence guarantees of a transactional database.
+
+## Performance notes
+
+Each check is **one transaction** — a `BEGIN`, one advisory lock acquisition, one `SELECT`, one `INSERT … ON CONFLICT`, and a `COMMIT`. With a local Postgres that is typically 1–3 ms. For hot keys where that round-trip cost matters, wrap the `PostgresStore` as the L2 of `twoTier({ mode: "leased" })`: the in-process tier absorbs the hot path and the Postgres tier enforces the global cap with far fewer transactions.
+
+<Note>
+  `PostgresStore` is async-only. `limiter.checkSync(key)` will throw at
+  runtime — always use `await limiter.check(key)` with this backend.
+</Note>
+
+## Failure behavior
+
+When the Postgres pool cannot reach the database, `apply` rejects with a `pg` error. The limiter's `fail` policy (`"open"` or `"closed"`) determines whether a failed check admits or denies the request. **Rate-limit state is preserved** in the Postgres table across reconnects, connection pool recycling, and even a database restart — the counts resume exactly from where they left off.

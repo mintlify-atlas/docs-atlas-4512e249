@@ -1,0 +1,235 @@
+---
+title: "Adaptive Concurrency"
+sidebarTitle: "Adaptive Concurrency"
+description: "A TCP-congestion-control-style ceiling on in-flight requests, inferred from latency gradient — no guessing the right static limit required."
+---
+
+Adaptive concurrency limits the number of in-flight requests at any moment by inferring a safe ceiling from observed latency, rather than from a statically configured number. When the system is fast and under-utilized, the ceiling grows. When latency climbs (indicating queueing behind the scenes) or requests start timing out, the ceiling shrinks. This is the right primitive when you don't know the right rate limit in advance, or when capacity changes dynamically.
+
+The implementation is modeled on Netflix's concurrency-limits library and supports two inference laws: the default **gradient2** algorithm (RTT-gradient based, continuous update) and **AIMD** (additive-increase/multiplicative-decrease, similar to TCP congestion control).
+
+## How it works
+
+Each request acquires a `Lease` from the `ConcurrencyGuard`. If the number of in-flight requests is below the current inferred ceiling, the lease is granted (`ok: true`) and the caller proceeds. If the ceiling is reached, the lease is rejected (`ok: false`) — the caller should shed the request (e.g., respond 503) rather than queue it.
+
+When the caller finishes the request, it calls `lease.release()`. The guard records the request's latency (time between `acquire()` and `release()`), feeds it into the inference law, and updates the ceiling.
+
+### Gradient2 (default)
+
+Compares the best-observed ("no-load") RTT to the current RTT. While the ratio stays near 1, the limit grows by `√limit` of headroom. As the current RTT climbs above the no-load baseline, a gradient drives the limit down multiplicatively. An EMA (`smoothing`) prevents oscillation:
+
+```
+gradient = clamp((tolerance * rttNoload) / rtt, 0.5, 1.0)
+queueSize = sqrt(estimate)
+newLimit = estimate * gradient + queueSize
+estimate = estimate * (1 - smoothing) + newLimit * smoothing
+```
+
+The no-load RTT is a **windowed rolling minimum** over the last `rttWindow` samples, so it can rise again after a deploy or load shift — "best recently observed", not an all-time minimum.
+
+### AIMD
+
+On a healthy request (RTT ≤ `tolerance * noload`): additive increase (+1), but only while actually pushing the ceiling. On a dropped request or RTT overshoot: multiplicative decrease (`estimate × backoffRatio`). Simpler and more aggressive than gradient2.
+
+## Options
+
+<ParamField path="minLimit" type="number">
+  Hard floor on the inferred ceiling. The estimate will never drop below this. Default `4`.
+</ParamField>
+
+<ParamField path="maxLimit" type="number">
+  Hard ceiling on the inferred ceiling. The estimate will never exceed this. Default `512`.
+</ParamField>
+
+<ParamField path="initialLimit" type="number">
+  Where the estimate starts. Default equals `minLimit`. The guard begins conservative and grows toward capacity as it observes healthy latency.
+</ParamField>
+
+<ParamField path="algorithm" type='"gradient2" | "aimd"'>
+  Which inference law drives the limit. Default `"gradient2"`. Use `"aimd"` for simpler, more aggressive decrease behavior.
+</ParamField>
+
+<ParamField path="rttWindow" type="number">
+  Sample count for the rolling-minimum no-load RTT baseline. Default `100`. Larger values make the baseline more stable but slower to adapt after a load shift.
+</ParamField>
+
+<ParamField path="smoothing" type="number">
+  Gradient2 EMA factor in `(0, 1]`. Larger values react faster to RTT changes; smaller values are more stable. Default `0.2`.
+</ParamField>
+
+<ParamField path="tolerance" type="number">
+  Headroom factor applied to the no-load RTT. A gradient of `tolerance * rttNoload / rtt` above 1.0 is clamped to 1.0; below 0.5 is clamped to 0.5. Default `2.0` — the limit starts decreasing when RTT exceeds twice the no-load baseline.
+</ParamField>
+
+<ParamField path="backoffRatio" type="number">
+  AIMD multiplicative decrease factor, in `[0.5, 1)`. Default `0.9`. Only used when `algorithm: "aimd"`.
+</ParamField>
+
+<ParamField path="recalibration" type="object">
+  Opt-in Envoy-style forced minRTT recalibration. When set, the guard periodically drains to `probeLimit` concurrency and measures the true no-load RTT, then adopts it as the fresh baseline. Off by default.
+
+  - **`intervalMs`** — re-probe at most this often (ms). Default `60_000`.
+  - **`probeLimit`** — effective ceiling during a probe. Default `minLimit`.
+  - **`probeSamples`** — clean low-concurrency samples to collect before adopting the baseline. Default `5`.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Injectable time source. Default system clock.
+</ParamField>
+
+## ConcurrencyGuard interface
+
+```ts
+interface ConcurrencyGuard {
+  acquire(): Lease;
+  readonly limit: number;    // current inferred ceiling (integer floor of estimate)
+  readonly inflight: number; // leases currently outstanding
+  stats(): { limit: number; inflight: number; rttNoload: number; lastRtt: number };
+}
+```
+
+## Lease interface
+
+```ts
+interface Lease {
+  readonly ok: boolean;
+  release(opts?: { dropped?: boolean }): void;
+}
+```
+
+- **`ok`** — `false` means the request is over the inferred ceiling and should be shed.
+- **`release({ dropped: true })`** — signals that the request failed or timed out, which is treated as an overload signal and triggers a larger decrease than a slow but successful request.
+- `release()` is idempotent and safe to call detached: `const r = lease.release; r()`.
+
+## Code example
+
+```ts
+import { adaptiveConcurrency } from "throttlekit";
+
+const guard = adaptiveConcurrency({
+  minLimit: 4,
+  maxLimit: 512,
+  algorithm: "gradient2",
+});
+
+async function handleRequest(): Promise<void> {
+  const lease = guard.acquire();
+
+  if (!lease.ok) {
+    // Over the inferred ceiling — shed the request
+    throw new Error("503 Service Unavailable");
+  }
+
+  try {
+    await doWork();
+    lease.release(); // latency is measured automatically (acquire → release)
+  } catch (err) {
+    // A failed/timed-out request is an overload signal
+    lease.release({ dropped: true });
+    throw err;
+  }
+}
+```
+
+### Full example with burst of concurrent work
+
+```ts
+import { adaptiveConcurrency } from "throttlekit";
+
+function fakeWork(inflight: number): Promise<void> {
+  // Latency grows with concurrency — gives the guard a signal to react to
+  const latency = 5 + inflight * 2;
+  return new Promise((resolve) => setTimeout(resolve, latency));
+}
+
+const guard = adaptiveConcurrency({ minLimit: 4, maxLimit: 512 });
+
+let shed = 0;
+let served = 0;
+
+const tasks = Array.from({ length: 50 }, async () => {
+  const lease = guard.acquire();
+  if (!lease.ok) {
+    shed++;
+    return;
+  }
+  try {
+    await fakeWork(guard.inflight);
+    served++;
+    lease.release();
+  } catch {
+    lease.release({ dropped: true });
+  }
+});
+
+await Promise.all(tasks);
+
+const stats = guard.stats();
+console.log("served:", served, "shed:", shed);
+console.log("inferred limit:", guard.limit, "inflight:", guard.inflight);
+console.log("stats:", stats); // { limit, inflight, rttNoload, lastRtt }
+```
+
+## Distributed adaptive concurrency
+
+For fleet deployments, `distributedAdaptiveConcurrency` coordinates the inferred ceiling across multiple processes. Each node runs a private `adaptiveConcurrency` guard for RTT inference, and a `ConcurrencyCoordinator` aggregates all nodes' local limits (`L_local`) into one global ceiling (`L_global`) and distributes equal shares to each node.
+
+The effective per-node ceiling is `min(share, local.limit)` — whenever the outer gate admits, the local guard is guaranteed to return `ok: true`.
+
+```ts
+import { distributedAdaptiveConcurrency, TestConcurrencyCoordinator } from "throttlekit";
+
+const coordinator = new TestConcurrencyCoordinator();
+
+const guard = distributedAdaptiveConcurrency({
+  coordinator,
+  nodeId: process.env.HOSTNAME ?? "node-1",
+  key: "inference-cluster", // nodes fronting the same backend must match
+  heartbeatMs: 1_000,       // heartbeat / lease-renewal period
+  local: { minLimit: 4, maxLimit: 512 },
+});
+
+// Optionally gate startup on the first share
+await guard.heartbeat();
+
+const lease = guard.acquire();
+if (!lease.ok) {
+  respond503();
+} else {
+  try {
+    await doWork();
+  } finally {
+    lease.release();
+  }
+}
+
+// On shutdown
+await guard.close();
+```
+
+### DistributedAdaptiveConcurrencyOptions (key fields)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `coordinator` | `ConcurrencyCoordinator` | required | Cross-node coordinator that owns `L_global` |
+| `nodeId` | `string` | required | Unique per-process identity |
+| `key` | `string` | `""` | Shared-backend key (all nodes fronting the same backend must match) |
+| `local` | `AdaptiveConcurrencyOptions` | `{}` | Forwarded to the private `adaptiveConcurrency` |
+| `heartbeatMs` | `number` | `1000` | Heartbeat / lease-renewal period in ms |
+| `leaseTtlMs` | `number` | `2 * heartbeatMs` | Lease TTL; must exceed `heartbeatMs` |
+| `onCoordinatorOutage` | `"fail-closed" \| "local-only"` | `"fail-closed"` | Behavior when the coordinator is unreachable |
+
+<Warning>
+  `nodeId` is required and has no default. A collision between two nodes' IDs corrupts the aggregate ceiling and causes under-admission across the fleet. Use a per-process unique value such as `process.env.HOSTNAME` or a UUID.
+</Warning>
+
+## When to use adaptive concurrency
+
+- **Unknown or changing capacity** — when you don't know the right static concurrency limit, or when it shifts with deployments and load patterns.
+- **Latency-sensitive services** — when you want to automatically shed load as soon as latency climbs, before queues overflow.
+- **Protection against overload cascades** — when a downstream dependency slows down, the guard automatically reduces admission to the affected service.
+- **Multi-service fan-out** — use `distributedAdaptiveConcurrency` when N independent processes front one shared backend and you need the fleet's total in-flight count to stay under one cooperatively-inferred global ceiling.
+
+<Tip>
+  Adaptive concurrency is a **concurrency** limit, not a rate limit. It bounds the number of simultaneous in-flight requests, not the rate of new requests. For rate limiting (requests per second/minute), use GCRA or another rate strategy.
+</Tip>

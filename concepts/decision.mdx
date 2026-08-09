@@ -1,0 +1,150 @@
+---
+title: "The Decision Interface in ThrottleKit"
+sidebarTitle: "Decision"
+description: "Every check returns an immutable Decision. Learn each field, why all fields are integers, and how peek and forecast work without consuming capacity."
+---
+
+Every `check`, `checkSync`, `peek`, `peekSync`, and `forecast` call in ThrottleKit returns — or is based on — a `Decision`. It is an immutable snapshot of the limiter's verdict for a single key at a single point in time. Understanding its fields is the foundation for writing correct rate-limit handling, setting HTTP headers, and scheduling client retries.
+
+## The Decision interface
+
+```ts
+interface Decision {
+  readonly allowed: boolean;
+  readonly limit: number;
+  readonly remaining: number;
+  readonly resetAt: number;
+  readonly retryAfterMs: number;
+}
+```
+
+<ResponseField name="allowed" type="boolean" required>
+  Whether the request is permitted. `true` means the request was admitted and capacity was consumed. `false` means the limit has been reached and the request should be rejected.
+</ResponseField>
+
+<ResponseField name="limit" type="number" required>
+  The effective ceiling reported to clients — the burst capacity (for GCRA and token bucket) or the window quota (for fixed/sliding window strategies). This is the value used in `RateLimit-Limit` HTTP headers.
+</ResponseField>
+
+<ResponseField name="remaining" type="number" required>
+  Whole units remaining before the next rejection. This value is **never negative**. For a consuming `check`, it reflects the capacity *after* the current request was charged. For a non-consuming `peek`, it reflects current capacity without any deduction.
+</ResponseField>
+
+<ResponseField name="resetAt" type="number" required>
+  Epoch milliseconds at which the limiter is **fully replenished** to its ceiling from the current state. Use `new Date(resetAt)` to convert for display. This drives `RateLimit-Reset` and `X-RateLimit-Reset` headers.
+</ResponseField>
+
+<ResponseField name="retryAfterMs" type="number" required>
+  Milliseconds the client should wait before retrying. Always `0` when `allowed` is `true`. When `allowed` is `false`, this is the minimum wait before the request would be permitted again — the value used in the `Retry-After` HTTP header (converted to seconds, rounded up to a minimum of 1).
+</ResponseField>
+
+## Why all fields are integers
+
+All numeric fields — `limit`, `remaining`, `resetAt`, `retryAfterMs` — are **integers**. This is a load-bearing constraint, not a cosmetic choice.
+
+Redis truncates Lua numbers to integers on reply. By restricting `Decision` fields to integers, ThrottleKit guarantees that the JavaScript execution path (in-memory) and the Redis-Lua execution path produce **bit-identical** values for every decision. This is what makes the dual-path conformance proof possible: the same timeline run through `MemoryStore` and `RedisStore` must produce the exact same sequence of decisions.
+
+<Note>
+  Internal strategy state (e.g. a GCRA theoretical-arrival-time timestamp) is stored at full IEEE-754 precision inside the store. Only the `Decision` fields surfaced to callers are integer-projected, preserving accuracy while enabling cross-backend byte equality.
+</Note>
+
+## Using Decision fields in practice
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+});
+
+async function handleRequest(userId: string) {
+  const d = await limiter.check(userId);
+
+  if (!d.allowed) {
+    // Set Retry-After header (seconds, rounded up, minimum 1)
+    const retryAfterSec = Math.max(1, Math.ceil(d.retryAfterMs / 1000));
+    const resetDate = new Date(d.resetAt);
+
+    return Response.json(
+      { error: "Too Many Requests", retryAfterMs: d.retryAfterMs },
+      {
+        status: 429,
+        headers: {
+          "Retry-After": String(retryAfterSec),
+          "RateLimit-Limit": String(d.limit),
+          "RateLimit-Remaining": String(d.remaining),
+          "RateLimit-Reset": String(Math.ceil(d.resetAt / 1000)),
+        },
+      }
+    );
+  }
+
+  // d.remaining — useful for dashboard and debugging headers
+  const response = await processRequest(userId);
+  return new Response(response, {
+    headers: {
+      "RateLimit-Limit": String(d.limit),
+      "RateLimit-Remaining": String(d.remaining),
+      "RateLimit-Reset": String(Math.ceil(d.resetAt / 1000)),
+    },
+  });
+}
+```
+
+## peek() — non-consuming introspection
+
+`peek` (and its synchronous counterpart `peekSync`) returns a `Decision` describing the **current capacity without consuming any**. The `remaining` and `resetAt` fields describe what is available *now*, not after a deduction.
+
+```ts
+// peek — async, works on any store
+const capacity = await limiter.peek("user-42");
+console.log(`${capacity.remaining} of ${capacity.limit} remaining`);
+console.log(`Resets at ${new Date(capacity.resetAt).toISOString()}`);
+
+// peekSync — synchronous, MemoryStore only
+const syncCapacity = limiter.peekSync?.("user-42");
+```
+
+<Tip>
+  Use `peek` to power quota dashboards, pre-flight checks, and "how many requests do I have left?" API endpoints — without accidentally charging the user for the inquiry itself.
+</Tip>
+
+`peek` is available on `rateLimit`-constructed limiters when the strategy implements the optional `peek` method. All eight built-in strategies implement it.
+
+## check() vs peek() — consuming vs non-consuming
+
+| Method | Consumes capacity | When to use |
+|---|:--:|---|
+| `check(key, cost?)` | ✅ Yes | Normal request admission — charges the key and returns the post-charge decision |
+| `checkSync(key, cost?)` | ✅ Yes | Same as `check` but synchronous; requires `MemoryStore` |
+| `peek(key)` | ❌ No | Read current capacity without admitting a request |
+| `peekSync(key)` | ❌ No | Synchronous `peek`; requires `MemoryStore` |
+
+A `peek` call never writes to the store. On Redis, it uses a read-only Lua path that issues no writes. On `MemoryStore`, `persist: false` is set on the transform result so no state update occurs.
+
+## forecast() — capacity projection
+
+`forecast` (and `forecastSync`) returns a `Forecast` — a non-consuming projection of the key's **near-future** capacity for a given cost:
+
+```ts
+interface Forecast {
+  readonly spendableNow: number;    // whole units of the given cost admissible right now
+  readonly nextReplenishAt: number; // epoch-ms when capacity next increases by at least one unit
+  readonly fullAt: number;          // epoch-ms when the limiter is fully replenished
+}
+```
+
+```ts
+const forecast = await limiter.forecast("user-42", 5); // cost = 5
+console.log(`Can admit ${forecast.spendableNow} cost-5 requests right now`);
+console.log(`Next replenishment: ${new Date(forecast.nextReplenishAt).toISOString()}`);
+console.log(`Fully replenished: ${new Date(forecast.fullAt).toISOString()}`);
+```
+
+<Info>
+  `forecast` is useful for adaptive retry scheduling and client-side quota planning. It is implemented by all built-in strategies and available on `rateLimit`-constructed limiters. Like `peek`, it never writes to the store.
+</Info>
+
+## Stability guarantee
+
+`Decision` is a **producer type** — the library returns it, you read it. Per the 1.x SemVer stability contract, it grows only by **appending optional `readonly` fields**. Future minor releases may add fields like `bindingAxis`. Do not use `zod.strict()` or exhaustive property validation on a `Decision` object — a strict consumer would break on any new optional field.

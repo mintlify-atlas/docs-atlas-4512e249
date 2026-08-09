@@ -1,0 +1,254 @@
+---
+title: "Observability"
+sidebarTitle: "Observability"
+description: "Decision taps, in-process analytics, OpenTelemetry integration, and the ThrottleKit Lens terminal dashboard for full rate-limit visibility."
+---
+
+Every ThrottleKit decision is a structured object — observability turns the stream of them into metrics, spans, and aggregates without coupling the library to any vendor SDK. Three layers are available: a raw decision tap for shipping to any sink, built-in in-process analytics with bounded-memory heavy-hitter tracking, and a full OpenTelemetry integration. The ThrottleKit Lens dashboard renders all of this in a terminal UI.
+
+## `tapDecisions()` — Raw Decision Stream
+
+`tapDecisions` wraps any `Limiter` and fires a callback once per completed check (after the decision resolves). The limiter is returned unchanged and all methods — including optional `peek` / `forecast` / `close` — are forwarded.
+
+```ts
+import { tapDecisions, type DecisionTap, type DecisionEvent } from "throttlekit/observability";
+
+const limiter = tapDecisions(
+  rateLimit({ strategy: gcra({ limit: 100, periodMs: 60_000 }) }),
+  (event) => {
+    if (!event.decision.allowed) {
+      log.warn({ key: event.key, retryAfterMs: event.decision.retryAfterMs }, "rate limited");
+    }
+    myHistogram.observe(event.durationMs);
+  },
+);
+```
+
+A throwing tap can never break the limiter — exceptions are caught and silently dropped.
+
+### `DecisionEvent`
+
+<ParamField path="key" type="string">
+  The key that was checked.
+</ParamField>
+
+<ParamField path="cost" type="number">
+  The effective cost of the check (default `1`).
+</ParamField>
+
+<ParamField path="decision" type="Decision">
+  The decision returned to the caller.
+</ParamField>
+
+<ParamField path="strategy" type="string">
+  The active strategy's stable name (`"gcra"`, `"tokenBucket"`, `"fixedWindow"`, etc.).
+</ParamField>
+
+<ParamField path="durationMs" type="number">
+  Wall time spent inside the inner check, in fractional milliseconds. For batch checks (`checkMany`), this is an equal share per key.
+</ParamField>
+
+<ParamField path="kind" type="DecisionKind">
+  Which method produced the event: `"check"` | `"checkSync"` | `"checkMany"` | `"checkManySync"`.
+</ParamField>
+
+---
+
+## `withAnalytics()` — Built-In In-Process Analytics
+
+`withAnalytics` wraps any limiter and tracks allow/deny counts and top-K heavy hitters in-process, on a fixed epoch-aligned window. No OpenTelemetry backend, no external peer, zero configuration.
+
+```ts
+import { withAnalytics } from "throttlekit/analytics";
+import { ManualClock, gcra, rateLimit } from "throttlekit";
+
+const clock = new ManualClock(0);
+
+const limiter = withAnalytics(
+  rateLimit({ strategy: gcra({ limit: 3, periodMs: 60_000 }), clock }),
+  { topK: 5, windowMs: 60_000, clock },
+);
+
+// Drive some traffic
+for (let i = 0; i < 10; i++) limiter.checkSync("198.51.100.7");  // 3 allowed, 7 denied
+for (let i = 0; i < 2; i++)  limiter.checkSync("203.0.113.9");   // both allowed
+
+const snap = limiter.analytics();
+console.log({ allowed: snap.allowed, denied: snap.denied, denyRate: snap.denyRate });
+console.log("topRequested:", snap.topRequested.map((h) => `${h.key}=${h.count}`).join(", "));
+console.log("topDenied:",    snap.topDenied.map((h) => `${h.key}=${h.count}`).join(", "));
+
+// After a window roll, counts reset
+clock.advance(60_000);
+console.log("after roll, total:", limiter.analytics().total); // 0
+```
+
+`withAnalytics` is `@experimental` — excluded from the 1.x SemVer guarantee.
+
+### `AnalyticsOptions`
+
+<ParamField path="topK" type="number">
+  How many heavy hitters each summary tracks. Bounds memory — at most `topK` slots regardless of distinct-key cardinality. Default `10`.
+</ParamField>
+
+<ParamField path="windowMs" type="number">
+  Fixed, epoch-aligned window width in milliseconds. Default `60_000`.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Injected clock for deterministic tests. Defaults to the system clock.
+</ParamField>
+
+### `AnalyticsSnapshot`
+
+<ParamField path="windowStartedAt" type="number">
+  Epoch-ms of the current window start.
+</ParamField>
+
+<ParamField path="windowMs" type="number">
+  The configured window width.
+</ParamField>
+
+<ParamField path="allowed" type="number">
+  Requests admitted in the current window.
+</ParamField>
+
+<ParamField path="denied" type="number">
+  Requests denied in the current window.
+</ParamField>
+
+<ParamField path="total" type="number">
+  `allowed + denied`.
+</ParamField>
+
+<ParamField path="denyRate" type="number">
+  `denied / total`, or `0` when `total` is `0`.
+</ParamField>
+
+<ParamField path="topRequested" type="HeavyHitter[]">
+  Keys driving the most requests this window, count-descending. At most `topK` entries.
+</ParamField>
+
+<ParamField path="topDenied" type="HeavyHitter[]">
+  Keys driving the most denials this window, count-descending. At most `topK` entries.
+</ParamField>
+
+### `HeavyHitter`
+
+```ts
+interface HeavyHitter {
+  key: string;
+  count: number; // Space-Saving upper-bound estimate; never under-counts a true heavy hitter
+}
+```
+
+Top-K tracking uses the **Space-Saving algorithm** (Metwally, Agrawal & El Abbadi, 2005): at most `topK` entries are held regardless of distinct-key cardinality, and it over-estimates only — never drops a true heavy hitter. This is the correct bias for abuse detection.
+
+---
+
+## OpenTelemetry Integration
+
+`throttlekit/otel` provides a first-class OpenTelemetry integration with a **frozen metric/attribute contract** — names are pinned by a contract test so a rename never silently breaks dashboards on a patch upgrade.
+
+```ts
+import { instrumentLimiter, instrumentGuard } from "throttlekit/otel";
+import { metrics } from "@opentelemetry/api";
+
+const meter  = metrics.getMeter("my-service");
+const limiter = instrumentLimiter(baseRateLimiter, meter);
+const guard   = instrumentGuard(concurrencyGuard, meter);
+```
+
+`@opentelemetry/api` is imported **type-only**, so it is erased at compile time — zero runtime dependency is added unless you install and initialize a concrete OTel SDK.
+
+### Frozen Metrics
+
+| Name | Type | Labels | Description |
+|---|---|---|---|
+| `throttlekit.checks` | Counter | `strategy`, `allowed` | Total check calls |
+| `throttlekit.remaining` | Histogram | `strategy` | Remaining capacity at each check |
+| `throttlekit.store.latency` | Histogram | `strategy` | Inner check wall-time, ms |
+| `throttlekit.concurrency.limit` | Gauge | — | Adaptive concurrency ceiling |
+| `throttlekit.concurrency.inflight` | Gauge | — | Current in-flight count |
+| `throttlekit.concurrency.rtt_noload` | Gauge | — | Estimated no-load RTT |
+
+### Frozen Span Attributes
+
+| Attribute | Description |
+|---|---|
+| `throttlekit.strategy` | Strategy name |
+| `throttlekit.allowed` | `true` / `false` |
+| `throttlekit.limit` | The `limit` field of the decision |
+| `throttlekit.remaining` | The `remaining` field |
+| `throttlekit.retry_after_ms` | The `retryAfterMs` field |
+| `throttlekit.binding_axis` | For `unifiedAdmission` denials: `"rate"` \| `"concurrency"` \| `"cost"` |
+
+### Binding-Axis Attribution
+
+`throttlekit.binding_axis` reports, for a denied `unifiedAdmission`, which of the three axes (rate / concurrency / cost) actually bound the decision. This is derived by `bindingAxisOf(lastDecisions())`:
+
+```ts
+import { bindingAxisOf } from "throttlekit/observability";
+
+const axis = bindingAxisOf(admit.lastDecisions());
+// → "rate" | "concurrency" | "cost" | undefined (on allow or policy-deny)
+```
+
+`bindingAxisOf` is the single source for both the in-band `UnifiedAdmission.bindingAxis` field and the OTel span attribute — they can never disagree.
+
+---
+
+## ThrottleKit Lens — Terminal Dashboard
+
+Start the ThrottleKit gRPC server with the `--tui` flag to launch the **Lens** in-terminal dashboard:
+
+```bash
+throttlekit-server --config .throttlekit.yaml --tui
+```
+
+Lens renders a live view of the monitoring hub across **eight tabbed views**:
+
+| Tab | What it shows |
+|---|---|
+| **Overview** | Allow/deny counts, deny rate, top requested and top denied keys for the current window |
+| **Latency** | p50 / p99 check latency histogram per policy |
+| **Fairness** | Per-tenant weighted share, WFE utilization, guaranteed floor vs actual usage |
+| **Capacity** | Adaptive concurrency ceiling, in-flight count, no-load RTT estimate |
+| **Guarantee** | GALE window-coupled leasing: per-window admitted vs limit, overshoot bound status |
+| **Cost Room** | Token-budget remaining, per-tenant cost burn rate, reservation efficiency |
+| **Replay** | Live denial feed (server-side rate-capped, backpressured — drops on a slow reader) |
+| **Plan** | Policy Plans: last recorded diff between current and candidate policy sets |
+
+Lens and the gRPC Monitor door are two views of the **same in-process telemetry hub** — one source of truth.
+
+---
+
+## Monitor Door — gRPC + Prometheus
+
+The ThrottleKit gRPC server exposes two programmatic read surfaces:
+
+**gRPC Monitor service** (`throttlekit.v1.Monitor`):
+- `GetSnapshot` — returns a typed `MonitorMeta` envelope plus per-policy/guard summaries and `raw_json` (the full `LensSnapshot` as JSON). The typed fields are the stable wire contract; evolving internal analytics ride in `raw_json`.
+- `Watch` — opens a live, server-side rate-capped and backpressured server-streamed denial feed. A slow reader drops events — it never grows server memory and never blocks the control path.
+
+**Prometheus `/metrics`** (enabled with `--metrics-port`):
+- Exposes aggregate, PII-free series only: per-policy allow/deny, per-axis denials, observed ceiling, p50/p99 latency, guard health.
+- No per-key series. This is what lets it default to loopback without auth.
+
+<Warning>
+The gRPC Monitor snapshot includes per-key data (top keys, denial feed), which may contain PII. It is **loopback-only** unless a `--monitor-secret` is configured (presented in gRPC call metadata, with TLS). The Prometheus `/metrics` endpoint is aggregate-only and requires no auth by default.
+</Warning>
+
+---
+
+<Accordion title="FAQ: Will a tap that throws break my rate limiter?">
+No. Every tap callback is wrapped in a try/catch. An exception inside your `onDecision` callback is silently dropped and the limiter continues operating normally. Observability must never be able to break the control path.
+</Accordion>
+
+<Accordion title="FAQ: Why is withAnalytics marked experimental?">
+The `analytics()` snapshot shape may evolve — new fields, changed semantics for edge cases — in a minor release. The core `Limiter` interface it wraps is stable, but the analytics surface is not yet covered by the 1.x SemVer guarantee. Use it freely; just expect that `resetAnalytics()` and the `AnalyticsSnapshot` fields may change before 1.0.
+</Accordion>
+
+<Accordion title="FAQ: How does Space-Saving avoid dropping heavy hitters?">
+The Space-Saving algorithm (Metwally et al. 2005) maintains at most `topK` monitor slots. When a new key arrives and the tracker is full, it evicts the minimum-count slot and gives the new key `count = min + 1`, inheriting the minimum as an over-estimation bound. This means an entry's `count` is always an upper bound on its true frequency — never an undercount. A genuine heavy hitter that has been seen many times will always have a count high enough to survive eviction; only truly light keys can be displaced.
+</Accordion>

@@ -1,0 +1,138 @@
+---
+title: "In-Memory Store"
+sidebarTitle: "In-Memory"
+description: "Zero-dependency, single-process store with second-chance CLOCK-LRU eviction, O(1) timing-wheel expiry, and a synchronous fast path."
+---
+
+`MemoryStore` is the default backend that ships inside ThrottleKit's core package — no installation step, no peer dependencies, no network. All state lives in a plain JavaScript `Map`, and because Node.js is single-threaded, a synchronous read-modify-write cannot interleave: `applySync` needs no locks and pays zero coordination overhead. The async `apply` simply resolves the same result, so every algorithm works identically on both the sync and async code paths.
+
+## How it works
+
+**Timing-wheel expiry.** Keys are bucketed into `wheelSize` hash-slots by their expiry tick. Each call to `applySync` advances the wheel to the current time, expiring only the slots that have come due — `O(due keys)`, not `O(all keys)`. A per-entry `exp` field on each map entry provides inline lazy expiry on the hot path without a second map lookup.
+
+**CLOCK eviction.** When `maxKeys` is set, cardinality is bounded by a second-chance ring. Each key access sets a reference bit; a sweeping hand clears bits and evicts the first key whose bit is already clear. This is `O(1)` amortized and reorder-free — it defends against adversarial floods of unique keys (e.g. spoofed IPs) without the per-read linked-list pointer updates that a true LRU would require.
+
+**Background sweep.** A `setInterval` timer (default every 5 000 ms) advances the wheel even when traffic is idle, reclaiming memory from keys that stopped receiving requests. The timer is `unref`'d so it never prevents a Node process from exiting. Set `sweepIntervalMs: 0` to disable it entirely — the right choice on edge runtimes that discourage background timers.
+
+## Installation
+
+`MemoryStore` is part of the `throttlekit` core package. No extra packages needed.
+
+```bash
+npm install throttlekit
+```
+
+## Quick example
+
+```ts
+import { rateLimit, gcra, MemoryStore } from "throttlekit";
+
+const store = new MemoryStore({
+  maxKeys: 50_000,      // evict with CLOCK once this many distinct keys are live
+  sweepIntervalMs: 10_000, // background expiry sweep every 10 s
+});
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+  store,
+});
+
+// Async path — works with any store
+const result = await limiter.check("user-42");
+console.log(result.allowed, result.remaining);
+
+// Sync fast path — MemoryStore only
+const sync = limiter.checkSync("user-42");
+console.log(sync.allowed, sync.remaining);
+```
+
+## Deterministic testing with `ManualClock`
+
+Inject a `ManualClock` to drive time forward deterministically in unit tests — no `setTimeout`, no `sleep`.
+
+```ts
+import { ManualClock, MemoryStore, rateLimit, gcra } from "throttlekit";
+
+const clock = new ManualClock(0);
+const limiter = rateLimit({
+  strategy: gcra({ limit: 2, periodMs: 1_000 }),
+  clock,
+  store: new MemoryStore({ clock }),
+});
+
+console.log(limiter.checkSync("k").allowed); // true  — burst slot 1
+console.log(limiter.checkSync("k").allowed); // true  — burst slot 2
+console.log(limiter.checkSync("k").allowed); // false — burst exhausted
+
+clock.advance(500); // one emission interval later (periodMs / limit = 500 ms)
+console.log(limiter.checkSync("k").allowed); // true  — one slot refilled
+```
+
+## Options
+
+<ParamField path="clock" type="Clock">
+  Injected time source. Defaults to the system clock (`Date.now()`). Pass a
+  `ManualClock` to drive expiry deterministically in tests.
+</ParamField>
+
+<ParamField path="maxKeys" type="number">
+  Maximum number of distinct live keys before CLOCK (second-chance) eviction
+  kicks in. Unbounded when omitted. **Set this on any public endpoint** so a
+  flood of unique keys cannot grow the map without limit.
+</ParamField>
+
+<ParamField path="sweepIntervalMs" type="number" default="5000">
+  Background sweep interval in milliseconds. The timer advances the timing
+  wheel so idle keys are reclaimed even without incoming traffic. Set `0` to
+  disable the timer entirely — cleanup then becomes purely access-driven, which
+  is the right choice on edge runtimes.
+</ParamField>
+
+<ParamField path="tickMs" type="number" default="1000">
+  Timing-wheel tick resolution in milliseconds. This is the cleanup granularity
+  (i.e. how precisely expired keys are reclaimed), not the decision precision —
+  every decision is exact regardless of tick size.
+</ParamField>
+
+<ParamField path="wheelSize" type="number" default="512">
+  Number of slots in the timing wheel. Together with `tickMs`, this sets the
+  span before TTLs "lap": `tickMs × wheelSize` milliseconds. The default covers
+  ~8.5 minutes at 1 s resolution, which suits most window sizes.
+</ParamField>
+
+## `applySync` / `checkSync`
+
+`MemoryStore` is the only built-in store that exposes a fully synchronous code path. `applySync` performs the read-modify-write in one JavaScript turn — no `await`, no microtask queue entry. Use `limiter.checkSync(key)` to take advantage of it in latency-critical hot paths such as tight request loops or middleware stacks that cannot tolerate even a single task boundary.
+
+<Note>
+  `checkSync` throws if the limiter's store does not implement `applySync`.
+  All distributed stores (Redis, Postgres, DynamoDB, edge) are async-only —
+  always use `await limiter.check(key)` with those backends.
+</Note>
+
+## When to use
+
+`MemoryStore` is the right choice when:
+
+- You are running a **single process** (or each process enforces its own independent limit).
+- You are writing **unit tests** and want deterministic, clock-controlled behavior.
+- You are prototyping or running **local development** and do not want to spin up Redis or Postgres.
+- You want the **absolute lowest latency** — no network hop, no serialization, no lock contention.
+
+For a multi-process deployment where all processes must share one counter, pair `MemoryStore` with a distributed backend via `twoTier`: the memory tier absorbs the hot path and the distributed tier enforces the global cap.
+
+<Warning>
+  All state is in RAM. A **process restart** resets every counter to zero. In
+  the worst case this allows one full burst window of over-admission before
+  counters re-accrue. This is by design for a single-process store — if you
+  need state to survive restarts, use Redis, Postgres, or another durable
+  backend.
+</Warning>
+
+<Tip>
+  Always set `maxKeys` on any public endpoint that receives untrusted or highly
+  varied keys (IP addresses, user IDs from external callers). Without a bound,
+  an attacker sending a flood of unique keys can grow the in-process map without
+  limit and cause an OOM. The CLOCK eviction policy is O(1) amortized and adds
+  no per-read overhead.
+</Tip>

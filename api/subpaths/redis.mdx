@@ -1,0 +1,216 @@
+---
+title: "throttlekit/redis — Redis Store"
+sidebarTitle: "Redis Store"
+description: "Distributed Store backed by Redis. Atomic Lua for built-in strategies, OCC fallback for custom ones, and adapters for ioredis, node-redis, and Upstash."
+---
+
+`throttlekit/redis` provides `RedisStore` — a distributed `Store` backed by Redis. Built-in
+strategies run their atomic Lua form in a single `EVALSHA` round trip with an automatic `EVAL`
+fallback on `NOSCRIPT`; custom strategies without a Lua form fall back to optimistic concurrency
+(`WATCH` / `MULTI` / `EXEC`) with bounded retries. Three client adapters normalize the API surface
+across `ioredis`, `node-redis`, and `@upstash/redis`.
+
+```ts
+import { RedisStore, fromIoredis } from "throttlekit/redis";
+import IORedis from "ioredis";
+
+const redis = new IORedis();
+const store = new RedisStore({ client: fromIoredis(redis) });
+```
+
+## RedisStore
+
+```ts
+class RedisStore implements Store {
+  constructor(options: RedisStoreOptions)
+  apply<S, R>(key: string, transform: Transform<S, R>): Promise<R>
+  reset(key: string): Promise<void>
+}
+```
+
+`RedisStore` is an async-only store: it does not implement `applySync`, so `limiter.checkSync` will
+throw. Use `await limiter.check(key)` on all Redis-backed limiters.
+
+### Options
+
+<ParamField body="client" type="RedisClientLike" required>
+  An `ioredis` (or compatible) client instance. Pass it through one of the factory adapters
+  (`fromIoredis`, `fromNodeRedis`, `fromUpstash`) to normalize the call shape. `ioredis` matches
+  `RedisClientLike` directly and can be passed without wrapping.
+</ParamField>
+
+<ParamField body="prefix" type="string">
+  Storage key namespace. Prepended to every Redis key as `prefix:key`. Lets multiple independent
+  stores share one Redis instance without key collisions.
+</ParamField>
+
+<ParamField body="useLua" type="boolean">
+  Use the atomic Lua path for strategies that ship one. Default `true`. Set `false` to force the OCC
+  fallback (useful when your Redis ACL forbids `EVAL`/`EVALSHA`).
+</ParamField>
+
+<ParamField body="useServerTime" type="boolean">
+  Derive `now` from the Redis server clock (`TIME`) inside the script, so node clock skew cannot
+  corrupt shared state. Default `true`. Set `false` for deterministic tests that pass an explicit
+  `now` via a `ManualClock`.
+</ParamField>
+
+<ParamField body="maxRetries" type="number">
+  Bounded retries for the optimistic-concurrency fallback (custom strategies). Default `5`. Exceeding
+  this limit throws a `StoreUnavailableError`.
+</ParamField>
+
+<ParamField body="ttlFloorMs" type="number">
+  Floor in ms on the **physical** Redis key TTL, decoupling GC from the strategy's logical window.
+  Default `0`. Set this when using `useServerTime: false` to prevent a logically-live key from being
+  reclaimed by real-time `PEXPIRE` before the logical window ends.
+</ParamField>
+
+## Client Adapters
+
+Three factories translate each client's native API into `RedisClientLike`, the single shape
+`RedisStore` speaks internally.
+
+### `fromIoredis(client)`
+
+Identity adapter for `ioredis`. `ioredis` already satisfies `RedisClientLike`, so this is a no-op
+shim provided for uniform code style.
+
+```ts
+import { fromIoredis } from "throttlekit/redis";
+import IORedis from "ioredis";
+
+const store = new RedisStore({ client: fromIoredis(new IORedis()) });
+// or, equivalently:
+const store2 = new RedisStore({ client: new IORedis() });
+```
+
+### `fromNodeRedis(client)`
+
+Adapt the official `redis` (node-redis) client. Both the Lua and OCC paths work. Each OCC
+transaction gets its own dedicated connection via `client.duplicate()` so concurrent `checkMany`
+calls cannot cross-contaminate each other's `WATCH` state.
+
+```ts
+import { fromNodeRedis } from "throttlekit/redis";
+import { createClient } from "redis";
+
+const redis = createClient();
+await redis.connect();
+
+const store = new RedisStore({ client: fromNodeRedis(redis) });
+```
+
+### `fromUpstash(client)`
+
+Adapt an `@upstash/redis` REST client for serverless and edge runtimes (Vercel, Cloudflare,
+Deno, Bun). Built-in strategies (all Lua-backed) work fully. Custom strategies that require
+optimistic concurrency (`WATCH` / `MULTI`) throw a `StoreUnavailableError` — the Upstash REST
+API does not support interactive `WATCH`.
+
+```ts
+import { fromUpstash } from "throttlekit/redis";
+import { Redis } from "@upstash/redis";
+
+const upstash = new Redis({ url: "...", token: "..." });
+const store = new RedisStore({ client: fromUpstash(upstash) });
+```
+
+## Client Types
+
+### `RedisClientLike`
+
+The minimal interface `RedisStore` needs. `ioredis` satisfies this structurally.
+
+```ts
+interface RedisClientLike {
+  evalsha(sha: string, numkeys: number, ...args: Array<string | number>): Promise<unknown>;
+  eval(script: string, numkeys: number, ...args: Array<string | number>): Promise<unknown>;
+  get(key: string): Promise<string | null>;
+  del(...keys: string[]): Promise<number>;
+  watch(...keys: string[]): Promise<unknown>;
+  unwatch(): Promise<unknown>;
+  multi(): RedisMultiLike;
+  duplicate?(): RedisClientLike;
+  disconnect?(): void | Promise<void>;
+}
+```
+
+### `NodeRedisLike`
+
+The slice of `redis` (node-redis) ThrottleKit uses. A `RedisClientType` satisfies it.
+
+```ts
+interface NodeRedisLike {
+  evalSha(sha: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
+  eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
+  get(key: string): Promise<string | null>;
+  del(keys: string | string[]): Promise<number>;
+  watch(keys: string | string[]): Promise<string>;
+  unwatch(): Promise<string>;
+  multi(): NodeRedisMultiLike;
+  duplicate(): NodeRedisLike;
+  connect(): Promise<unknown>;
+  quit(): Promise<unknown>;
+}
+```
+
+### `UpstashRedisLike`
+
+The slice of `@upstash/redis` ThrottleKit uses. `Redis` from `@upstash/redis` satisfies it.
+
+```ts
+interface UpstashRedisLike {
+  evalsha(sha: string, keys: string[], args: unknown[]): Promise<unknown>;
+  eval(script: string, keys: string[], args: unknown[]): Promise<unknown>;
+  get<TData = string>(key: string): Promise<TData | null>;
+  del(...keys: string[]): Promise<number>;
+}
+```
+
+## Cluster Hash-Tag Behavior
+
+On a Redis Cluster, `EVAL` / `EVALSHA` require that all `KEYS` used in the script hash to the same
+slot. ThrottleKit strategies that use multiple keys (e.g. sliding window log's sorted set) implement
+`LuaProgram.buildKeys(key)` to apply a consistent hash tag to the keys they touch, so all of a
+key's state lands in the same slot automatically.
+
+For prefix-based namespacing on Cluster, include a hash tag in your prefix:
+
+```ts
+// Keys become: {myservice}:user:42 — the hash tag forces slot assignment from {myservice}
+const store = new RedisStore({ client, prefix: "{myservice}" });
+```
+
+## EVALSHA Script Caching
+
+`RedisStore` caches SHA-1 digests of each Lua script in-process and attempts `EVALSHA` first. On a
+`NOSCRIPT` error (script cache flushed after a restart or failover) it falls back to `EVAL`, which
+re-caches the script on the Redis server for subsequent calls. This is transparent — all strategies
+remain fully functional across restarts with no manual script loading step.
+
+## Usage with rateLimit
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+import { RedisStore, fromNodeRedis } from "throttlekit/redis";
+import { createClient } from "redis";
+
+const client = createClient({ url: process.env.REDIS_URL });
+await client.connect();
+
+const store = new RedisStore({
+  client: fromNodeRedis(client),
+  prefix: "rl:api",
+  useServerTime: true,
+  ttlFloorMs: 5_000,
+});
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 500, periodMs: 60_000 }),
+  store,
+});
+
+await limiter.close(); // closes the owned MemoryStore if any; the Redis pool is yours to close
+await client.quit();
+```

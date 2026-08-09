@@ -1,0 +1,470 @@
+---
+title: "Edge & Serverless Adapters"
+sidebarTitle: "Edge & Serverless"
+description: "Rate-limit Cloudflare Workers, SvelteKit, Remix, Elysia, and AWS Lambda with zero peer dependencies and Web-standard Request/Response."
+---
+
+ThrottleKit's edge and serverless adapters share one design constraint: they must work without framework peer dependencies and without Node-specific APIs. They bind to Web-standard `Request` and `Response` objects (available on Node 18+, Cloudflare Workers, Deno, Bun, and all major edge runtimes), so the same code runs locally in development and deployed at the edge.
+
+---
+
+## Web `fetch` adapter
+
+Import from `throttlekit/fetch`. `withRateLimit` wraps any `(Request, ...args) => Response` handler with a rate-limit gate: on allow it forwards to the handler and copies the rate-limit headers onto the returned `Response`; on deny it returns a `429` with `Retry-After`. No peer dependencies.
+
+**Runs on:** Cloudflare Workers · Deno · Bun · Next.js edge runtime · Node.js ≥ 18
+
+```ts
+import { withRateLimit } from "throttlekit/fetch";
+import { gcra } from "throttlekit";
+
+// Your normal handler: receives a Web Request, returns a Web Response.
+function handler(req: Request): Response {
+  const path = new URL(req.url).pathname;
+  return new Response(JSON.stringify({ hello: path }), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// Wrap it with a rate-limit gate.
+// Default key: cf-connecting-ip → x-forwarded-for (via trust chain) → "anon".
+const fetchHandler = withRateLimit(handler, {
+  strategy: gcra({ limit: 30, periodMs: 10_000 }),
+  fail: "open",
+  emit: { draft: true },
+  ipv6Prefix: 64,
+});
+
+// Cloudflare Workers / Deno-style export:
+export default { fetch: fetchHandler };
+```
+
+**Smoke test**
+
+```ts
+const req = new Request("https://example.com/widgets", {
+  headers: { "cf-connecting-ip": "203.0.113.10" },
+});
+const res = await fetchHandler(req);
+console.log("status:", res.status);                               // 200
+console.log("RateLimit-Remaining:", res.headers.get("RateLimit-Remaining")); // "29"
+console.log("body:", await res.text());                           // {"hello":"/widgets"}
+```
+
+**Signature**
+
+```ts
+type FetchHandler = (request: Request, ...args: unknown[]) => Response | Promise<Response>;
+
+function withRateLimit(
+  handler: FetchHandler,
+  options: FetchRateLimitOptions,
+): (request: Request, ...args: unknown[]) => Promise<Response>
+```
+
+<ParamField body="strategy" type="Strategy" required>
+  The rate-limiting strategy — `gcra(...)`, `fixedWindow(...)`, etc. Alternatively pass a prebuilt `{ limiter }`.
+</ParamField>
+
+<ParamField body="key" type="(request: Request) => string">
+  Derive the limit key. Default: `cf-connecting-ip` → `x-forwarded-for` → `"anon"`. Override with a user ID or API token from a header or cookie.
+</ParamField>
+
+<ParamField body="cost" type="number | (request: Request) => number">
+  Units to deduct per request. Default `1`.
+</ParamField>
+
+<ParamField body="fail" type='"open" | "closed"'>
+  Store-outage behavior. Default `"open"` (allow the request). Use `"closed"` to respond `503` when the backing store is unreachable.
+</ParamField>
+
+<ParamField body="emit" type="HeaderEmit">
+  Header families to write. Default `{ draft: true }` (`RateLimit-Limit/Remaining/Reset`).
+</ParamField>
+
+<ParamField body="trustProxy" type="number">
+  Number of trusted reverse-proxy hops when reading `X-Forwarded-For`. Default `0`. Set to `1` when deployed behind a known proxy.
+</ParamField>
+
+<ParamField body="ipv6Prefix" type="number">
+  Aggregate IPv6 addresses to this prefix length (e.g. `64`). Prevents key rotation by cycling addresses.
+</ParamField>
+
+<ParamField body="handler" type="(request, decision) => Response | Promise<Response>">
+  Custom denial responder. When provided it fully owns the `429` body.
+</ParamField>
+
+### Cloudflare Workers
+
+```ts
+// worker.ts
+import { withRateLimit } from "throttlekit/fetch";
+import { gcra } from "throttlekit";
+import { CloudflareStore } from "throttlekit/cloudflare";
+
+const rateLimitedFetch = withRateLimit(
+  async (request: Request, env: Env) => {
+    return new Response("Hello, world!", { status: 200 });
+  },
+  {
+    strategy: gcra({ limit: 60, periodMs: 60_000 }),
+    // Store backed by a Cloudflare Durable Object for true cross-region coordination:
+    store: new CloudflareStore({ namespace: "RATE_LIMIT" }),
+    fail: "open",
+    emit: { draft: true },
+  },
+);
+
+export default { fetch: rateLimitedFetch };
+```
+
+### Next.js edge middleware
+
+```ts
+// middleware.ts (edge runtime)
+import { withRateLimit } from "throttlekit/fetch";
+import { gcra } from "throttlekit";
+import { NextResponse } from "next/server";
+
+const limiter = withRateLimit(
+  (req: Request) => NextResponse.next(),
+  {
+    strategy: gcra({ limit: 30, periodMs: 10_000 }),
+    fail: "open",
+  },
+);
+
+export default limiter;
+export const config = { matcher: "/api/:path*" };
+```
+
+### Unified admission (fetch)
+
+For combined rate + adaptive concurrency + cost enforcement, use `withUnifiedAdmission`. It wraps `Response.body` in a `ReadableStream` so the slot release fires when the body drains, errors, or the client cancels.
+
+```ts
+import { withUnifiedAdmission } from "throttlekit/fetch";
+import { unifiedAdmission, gcra, adaptiveConcurrency } from "throttlekit";
+
+const admitter = unifiedAdmission({
+  rate: gcra({ limit: 60, periodMs: 60_000 }),
+  concurrency: adaptiveConcurrency({ minLimit: 4, maxLimit: 128 }),
+});
+
+export default {
+  fetch: withUnifiedAdmission(myHandler, { admitter }),
+};
+```
+
+---
+
+## SvelteKit
+
+Import from `throttlekit/sveltekit`. `sveltekitRateLimit` returns a `handle` hook for `src/hooks.server.ts`. The default key is `event.getClientAddress()` — SvelteKit's platform-resolved client IP, which respects the adapter's trust configuration automatically.
+
+No `@sveltejs/kit` import is required. The `RequestEvent` and `Handle` shapes are modeled structurally.
+
+```ts
+// src/hooks.server.ts
+import { sveltekitRateLimit } from "throttlekit/sveltekit";
+import { gcra } from "throttlekit";
+
+export const handle = sveltekitRateLimit({
+  strategy: gcra({ limit: 60, periodMs: 60_000 }),
+  fail: "open",
+  emit: { draft: true },
+  onLimited: (event, d) =>
+    console.warn("limited", event.request.url, d.retryAfterMs),
+});
+```
+
+**Key override** — use a token from a cookie or header instead of the IP:
+
+```ts
+export const handle = sveltekitRateLimit({
+  strategy: gcra({ limit: 60, periodMs: 60_000 }),
+  key: (event) => {
+    const token = event.request.headers.get("x-api-key");
+    return token ?? event.getClientAddress();
+  },
+});
+```
+
+**Signature**
+
+```ts
+function sveltekitRateLimit(options: SvelteKitRateLimitOptions): SvelteKitHandle
+```
+
+`SvelteKitHandle` is `({ event, resolve }) => Promise<Response>` — the same shape as SvelteKit's built-in `Handle` type.
+
+### Chaining with `sequence`
+
+Compose with SvelteKit's `sequence` helper to combine multiple hooks:
+
+```ts
+import { sequence } from "@sveltejs/kit/hooks";
+import { sveltekitRateLimit } from "throttlekit/sveltekit";
+import { gcra } from "throttlekit";
+
+const rateLimit = sveltekitRateLimit({
+  strategy: gcra({ limit: 60, periodMs: 60_000 }),
+});
+
+export const handle = sequence(rateLimit, authHandler);
+```
+
+### Unified admission (SvelteKit)
+
+```ts
+import { sveltekitUnifiedAdmission } from "throttlekit/sveltekit";
+import { unifiedAdmission, gcra, adaptiveConcurrency } from "throttlekit";
+
+const admitter = unifiedAdmission({
+  rate: gcra({ limit: 100, periodMs: 60_000 }),
+  concurrency: adaptiveConcurrency({ minLimit: 4, maxLimit: 128 }),
+});
+
+export const handle = sveltekitUnifiedAdmission({ admitter });
+```
+
+---
+
+## Remix / React Router
+
+Import from `throttlekit/remix`. `remixRateLimit` returns a guard you call at the top of a `loader` or `action`. Under the limit it resolves to a `Record<string, string>` of rate-limit headers you attach to your response. Over the limit it **throws** a `429 Response` — Remix renders thrown `Response` objects directly, so no additional error handling is needed.
+
+```ts
+// app/routes/api.posts.tsx
+import { json, type LoaderFunctionArgs } from "@remix-run/node";
+import { remixRateLimit } from "throttlekit/remix";
+import { gcra } from "throttlekit";
+
+const rateLimit = remixRateLimit({
+  strategy: gcra({ limit: 60, periodMs: 60_000 }),
+  fail: "open",
+  emit: { draft: true },
+  onLimited: (request, d) =>
+    console.warn("limited", request.url, d.retryAfterMs),
+});
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  // throws a 429 Response when over the limit — Remix renders it automatically
+  const headers = await rateLimit(request);
+  const data = await getData();
+  return json(data, { headers });
+}
+
+export async function action({ request }: LoaderFunctionArgs) {
+  const headers = await rateLimit(request);
+  // ...
+  return json({ ok: true }, { headers });
+}
+```
+
+**Signature**
+
+```ts
+type RemixRateLimitGuard = (request: Request) => Promise<Record<string, string>>;
+
+function remixRateLimit(options: RemixRateLimitOptions): RemixRateLimitGuard
+```
+
+The resolved headers are a plain `Record<string, string>` — pass them directly to `json()`, `redirect()`, or any other Remix response helper.
+
+### Unified admission (Remix)
+
+`remixUnifiedAdmission` wraps the entire loader/action as a higher-order function:
+
+```ts
+import { remixUnifiedAdmission } from "throttlekit/remix";
+import { unifiedAdmission, gcra, adaptiveConcurrency } from "throttlekit";
+
+const admitter = unifiedAdmission({
+  rate: gcra({ limit: 60, periodMs: 60_000 }),
+  concurrency: adaptiveConcurrency({ minLimit: 4, maxLimit: 128 }),
+});
+
+export const loader = remixUnifiedAdmission(
+  async ({ request }) => json(await getData()),
+  { admitter },
+);
+```
+
+The release fires when the `Response.body` stream drains, errors, or the client cancels — keeping the in-flight concurrency count accurate across streaming responses.
+
+---
+
+## Elysia
+
+Import from `throttlekit/elysia`. `elysiaRateLimit` returns an `onBeforeHandle` hook. The hook returns `undefined` to proceed, or sets `ctx.set.status = 429` and returns a body to short-circuit.
+
+```ts
+import { Elysia } from "elysia";
+import { elysiaRateLimit } from "throttlekit/elysia";
+import { gcra } from "throttlekit";
+
+new Elysia()
+  .onBeforeHandle(
+    elysiaRateLimit({
+      strategy: gcra({ limit: 30, periodMs: 10_000 }),
+      fail: "open",
+      emit: { draft: true },
+      // Default key: cf-connecting-ip → x-forwarded-for → "anon"
+      key: (ctx) => ctx.request.headers.get("x-api-key") ?? "anon",
+      onLimited: (ctx, d) =>
+        console.warn("limited", new URL(ctx.request.url).pathname, d.retryAfterMs),
+    }),
+  )
+  .get("/", () => "ok")
+  .listen(3000);
+```
+
+**Signature**
+
+```ts
+type ElysiaRateLimitHook = (ctx: ElysiaContextLike) => unknown;
+
+function elysiaRateLimit(options: ElysiaRateLimitOptions): ElysiaRateLimitHook
+```
+
+### Unified admission (Elysia)
+
+Elysia's lifecycle hooks (`onBeforeHandle` / `onAfterHandle` / `onError`) cannot tie a single `admit()` to its `release()` across three callbacks without per-request state. ThrottleKit uses a manual wrap pattern instead — call `await admit(ctx, async () => handler-body)` inside the route handler:
+
+```ts
+import { elysiaUnifiedAdmission } from "throttlekit/elysia";
+import { unifiedAdmission, gcra, adaptiveConcurrency } from "throttlekit";
+
+const admitter = unifiedAdmission({
+  rate: gcra({ limit: 60, periodMs: 60_000 }),
+  concurrency: adaptiveConcurrency({ minLimit: 4, maxLimit: 128 }),
+});
+
+const admit = elysiaUnifiedAdmission({ admitter });
+
+new Elysia()
+  .get("/", (ctx) =>
+    admit(ctx, async () => {
+      return { ok: true };
+    }),
+  )
+  .listen(3000);
+```
+
+The release fires in a `try/finally` block with `dropped = thrown`, keeping the adaptive controller's RTT sampler accurate.
+
+---
+
+## AWS Lambda
+
+Import from `throttlekit/lambda`. `lambdaRateLimit` wraps a Lambda API Gateway proxy handler. It supports both REST API (payload v1) and HTTP API (payload v2) event shapes. Built on `createEnforcer` — no `@types/aws-lambda` peer dependency required.
+
+```ts
+// handler.ts
+import { lambdaRateLimit } from "throttlekit/lambda";
+import { gcra } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+
+async function myHandler(event: ApiGatewayEventLike) {
+  return {
+    statusCode: 200,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ok: true }),
+  };
+}
+
+export const handler = lambdaRateLimit(myHandler, {
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  // Use a shared Redis store — each Lambda invocation is a cold-ish process,
+  // so in-memory state does not persist between invocations.
+  store: new RedisStore({ client }),
+  fail: "open",
+  emit: { draft: true },
+});
+```
+
+**Default key** — the API Gateway-provided source IP:
+
+```ts
+// v2 HTTP API: event.requestContext.http.sourceIp
+// v1 REST API: event.requestContext.identity.sourceIp
+// Fallback:    "anon"
+```
+
+Use `sourceIpOf(event)` directly if you need the raw IP for other purposes:
+
+```ts
+import { sourceIpOf } from "throttlekit/lambda";
+
+const ip = sourceIpOf(event); // "203.0.113.5"
+```
+
+**Signature**
+
+```ts
+function lambdaRateLimit<E extends ApiGatewayEventLike, R extends LambdaResultLike>(
+  handler: LambdaHandler<E, R>,
+  options: LambdaRateLimitOptions<E>,
+): (event: E, ...rest: unknown[]) => Promise<LambdaResultLike>
+```
+
+**Denial behavior**
+
+| Outcome | Status | Body |
+|---|---|---|
+| Over the limit | `429` | `{ "error": "Too Many Requests", "retryAfterMs": … }` |
+| Store unreachable (`fail: "closed"`) | `503` | `{ "error": "rate limiter unavailable" }` |
+| Store unreachable (`fail: "open"`) | Handler runs | — |
+
+On allow, ThrottleKit merges the rate-limit headers into the handler's result — existing headers take lower precedence, so the limiter's values are always accurate.
+
+### Shared store for Lambda
+
+Lambda invocations are cold-start processes. An in-memory store does not persist between invocations — use a shared store backed by Redis, DynamoDB, or another durable backend:
+
+<Tabs>
+  <Tab title="Redis">
+    ```ts
+    import { RedisStore } from "throttlekit/redis";
+    import Redis from "ioredis";
+
+    const client = new Redis(process.env.REDIS_URL);
+
+    export const handler = lambdaRateLimit(myHandler, {
+      strategy: gcra({ limit: 100, periodMs: 60_000 }),
+      store: new RedisStore({ client }),
+    });
+    ```
+  </Tab>
+  <Tab title="DynamoDB">
+    ```ts
+    import { DynamoDBStore } from "throttlekit/dynamodb";
+    import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+
+    const dynamodb = new DynamoDBClient({});
+
+    export const handler = lambdaRateLimit(myHandler, {
+      strategy: gcra({ limit: 100, periodMs: 60_000 }),
+      store: new DynamoDBStore({ client: dynamodb, tableName: "rate-limits" }),
+    });
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## No peer dependencies
+
+All edge and serverless adapters — `throttlekit/fetch`, `throttlekit/sveltekit`, `throttlekit/remix`, `throttlekit/elysia`, and `throttlekit/lambda` — ship with **zero runtime dependencies** and zero framework peer dependencies. They bind only to the global `Request`, `Response`, and `Headers` objects defined by the Web Platform, available on:
+
+| Runtime | Available since |
+|---|---|
+| Node.js | 18.0 |
+| Cloudflare Workers | Always |
+| Deno | Always |
+| Bun | Always |
+| Next.js edge runtime | Always |
+| Vercel Edge Functions | Always |
+
+The only case where a dependency is needed is a shared store (e.g. `throttlekit/redis` requires `ioredis` or `node-redis`). Without a store, ThrottleKit defaults to an in-process store — which resets on each cold start for Lambda/Workers, so plan accordingly.

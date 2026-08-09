@@ -1,0 +1,224 @@
+---
+title: "Rate-Limiting Strategies in ThrottleKit"
+sidebarTitle: "Strategies"
+description: "Strategies are pure (state, now, cost) functions portable to Redis Lua, proven bit-identical. Covers GCRA, token bucket, sliding window, and how to choose."
+---
+
+A strategy is the algorithm that decides whether a request should be allowed. In ThrottleKit, every strategy is a **pure function of `(state, now, cost)`** — no I/O, no clock reads, no side effects. This design makes strategies trivially testable, portable to an atomic Redis Lua script, and provably bit-identical across all backends.
+
+## The Strategy interface
+
+```ts
+interface Strategy<S = unknown> {
+  /** Stable identifier surfaced in RateLimit-Policy and metrics (e.g. "gcra"). */
+  readonly name: string;
+  /** Effective ceiling reported to clients (burst capacity or window quota). */
+  readonly limit: number;
+  /** Effective window length in ms, surfaced as the `w` of RateLimit-Policy. Optional. */
+  readonly windowMs?: number;
+  /** Upper bound on how long state stays relevant; used as the store TTL hint. */
+  readonly ttlMs: number;
+  /** The pure transition: (state, now, cost) → { state, result, ttlMs, persist }. */
+  check(state: S | undefined, now: number, cost: number): StrategyOutcome<S>;
+  /** Optional atomic Redis Lua form. When present, a Lua-capable store runs it in one round trip. */
+  readonly lua?: LuaProgram;
+  /**
+   * Non-consuming introspection: the Decision for the current state at `now`
+   * without consuming any capacity. The basis of Limiter.peek.
+   */
+  peek?(state: S | undefined, now: number): Decision;
+  /** Non-consuming capacity projection. The basis of Limiter.forecast. */
+  forecast?(state: S | undefined, now: number, cost: number): Forecast;
+  /**
+   * Read-only access to stored state for a Lua-capable store.
+   * Required for peek/forecast to work over a Redis store.
+   */
+  readonly readState?: ReadState<S>;
+}
+```
+
+The `check` method is the pure transition. It takes the previous serialized state (or `undefined` on first touch), the current timestamp in epoch milliseconds, and the cost of the request, and returns the next state and a `Decision`. The store handles persistence atomically; the strategy never touches I/O.
+
+## The cost parameter
+
+Every `check` and `checkSync` call accepts an optional `cost` (default `1`). Cost lets a single admission count for more than one unit — useful for:
+
+- **Bulk endpoints**: a batch import endpoint that processes 100 records might charge `cost: 100`.
+- **LLM token budgets**: charge the number of tokens consumed (known post-hoc; see `tokenBudget`).
+- **Tiered pricing**: POST requests are more expensive than GETs, so `cost: (req) => req.method === "POST" ? 5 : 1`.
+
+```ts
+// Spend 10 units in one atomic check
+const d = await limiter.check("user-42", 10);
+```
+
+Cost is always a positive integer (validated on entry; `RangeError` for non-positive or non-finite values).
+
+## Built-in strategies
+
+### gcra — Generic Cell Rate Algorithm *(default)*
+
+**State:** one timestamp per key (`number`). **Memory:** O(1).
+
+GCRA tracks a **Theoretical Arrival Time (TAT)** — the earliest moment a perfectly-paced next request could arrive. One number per key, no buckets to refill, no arrays to trim. Smooth pacing with a configurable burst allowance.
+
+```ts
+import { gcra } from "throttlekit";
+
+gcra({
+  limit: 100,         // requests per periodMs
+  periodMs: 60_000,   // 1 minute
+  burst: 20,          // instantaneous allowance above the steady rate (defaults to limit)
+})
+```
+
+Starting cold, a key admits exactly `burst` requests instantaneously, then paces at exactly `limit / periodMs`. **Use GCRA when** you want smooth pacing, tiny state, and a great general default. It is the recommended starting point for most applications.
+
+### tokenBucket — explicit token count
+
+**State:** `{ tokens, last }`. **Memory:** O(1).
+
+A bucket of `capacity` tokens that refills at `refillPerSec` tokens per second. Each request spends `cost` tokens. GCRA is mathematically equivalent for `burst = capacity`, but token bucket surfaces a literal token count in `remaining`, which some teams prefer for client UX.
+
+```ts
+import { tokenBucket } from "throttlekit";
+
+tokenBucket({
+  capacity: 20,        // maximum burst size
+  refillPerSec: 1.67,  // steady-state rate (~100/min)
+})
+```
+
+### fixedWindow — aligned time windows
+
+**State:** `{ start, count }`. **Memory:** O(1).
+
+A counter per aligned `windowMs` period. Cheapest and simplest. **Known limitation:** up to 2× the limit may be admitted across a window boundary — two bursts of `limit` landing just before and just after the reset. This is a documented, understood trade-off, not a bug.
+
+```ts
+import { fixedWindow } from "throttlekit";
+
+fixedWindow({
+  limit: 100,
+  windowMs: 60_000,
+})
+```
+
+On Redis, this collapses to a single `INCR` + `PEXPIRE` (first hit) or `INCR` (subsequent hits) — the most efficient possible distributed implementation.
+
+### slidingWindow — near-exact rolling window
+
+**State:** `S` sub-buckets (default 10). **Memory:** O(buckets).
+
+The window is divided into `buckets` sub-buckets. The count is the sum of sub-buckets overlapping `[now − windowMs, now]`, with the oldest partial bucket weighted by its overlap fraction. **Error is bounded by one bucket width** (≈ `1/buckets` of the window) while memory stays O(buckets) regardless of the limit. This is the sweet spot between fixed window (cheap, 2× boundary error) and exact log (precise, O(limit) memory).
+
+```ts
+import { slidingWindow } from "throttlekit";
+
+slidingWindow({
+  limit: 100,
+  windowMs: 60_000,
+  buckets: 10,   // optional, defaults to 10
+})
+```
+
+### slidingWindowLog — exact rolling window
+
+**State:** ascending `number[]` of hit timestamps. **Memory:** O(limit).
+
+Stores the timestamp of every accepted hit and counts those within the trailing `windowMs`. **Exact** — no boundary approximation — but memory grows with the limit. Use for low or moderate limits where precision matters (e.g., 5 password-reset attempts per hour).
+
+```ts
+import { slidingWindowLog } from "throttlekit";
+
+slidingWindowLog({
+  limit: 5,
+  windowMs: 3_600_000, // 1 hour
+})
+```
+
+### leakyBucket — traffic shaping / queueing
+
+**State:** scheduling timestamps. **Memory:** O(1).
+
+A *shaping* variant that **delays** rather than rejects, smoothing output to a fixed drain rate. Useful for outbound rate shaping (e.g., a third-party API budget). `limiter.schedule(key)` resolves when a slot is available, with a `maxQueueMs` ceiling that rejects rather than queuing indefinitely.
+
+```ts
+import { leakyBucket } from "throttlekit";
+
+leakyBucket({
+  ratePerSec: 10,
+  maxQueueMs: 5_000,
+})
+```
+
+### adaptiveConcurrency — backpressure from latency
+
+**State:** rolling latency measurements. **Memory:** O(window size).
+
+Not a rate — a dynamically inferred ceiling on **in-flight** requests. Modeled on TCP congestion control and Netflix's `concurrency-limits`. Measures the latency gradient (`RTT_noload / RTT_actual`) and adjusts the concurrency limit with AIMD: multiplicative decrease when latency degrades, additive increase when the service is healthy.
+
+```ts
+import { adaptiveConcurrency } from "throttlekit";
+
+const guard = adaptiveConcurrency({
+  minLimit: 4,
+  maxLimit: 512,
+  algorithm: "gradient2",
+});
+
+const lease = guard.acquire(); // rejected if over the inferred ceiling
+if (!lease.ok) return Response.json({ error: "Overloaded" }, { status: 503 });
+try {
+  return await handleRequest();
+} finally {
+  lease.release(); // records latency automatically
+}
+```
+
+### quota — billing-period budgets
+
+**State:** per-period counters. **Memory:** O(1).
+
+Billing-period budgets with calendar-aware reset cadences. Supports `"calendar-month"`, `"calendar-week"`, `"calendar-day"`, `"fixed"`, and `"rolling"` periods. Leap-year-correct.
+
+```ts
+import { quota } from "throttlekit";
+
+quota({
+  limit: 10_000,
+  cadence: "calendar-month",
+})
+```
+
+## Isomorphic dual-path: JS + Lua, proven bit-identical
+
+Every built-in strategy is authored **once** as a pure JavaScript transition and compiled to two executors:
+
+1. **JavaScript path** — used in-process with `MemoryStore`, and as an OCC fallback on any store.
+2. **Redis Lua path** — a hand-verified atomic script run via `EVALSHA` in a single round trip.
+
+A shared **conformance vector** suite runs thousands of generated `(arrivals, costs, clock)` timelines through both paths and asserts that every decision in the stream is **byte-identical**. This is what backs the claim that you can develop and test in-memory with `MemoryStore` and deploy on Redis without any behavioral surprise.
+
+The key mechanism: all `Decision` fields are integers (Redis truncates Lua numbers on reply), and internal GCRA/token-bucket state is persisted at full IEEE-754 precision via `string.format('%.17g', v)` so timestamps round-trip exactly.
+
+<Note>
+  Custom strategies do not require a Lua form. Without `lua`, the strategy falls back to optimistic concurrency (`WATCH`/`MULTI`/`EXEC`) on Redis — correct everywhere, slightly slower on hot keys. A custom strategy that provides a Lua form can have it conformance-tested with the same vector suite.
+</Note>
+
+## Choosing the right strategy
+
+| Goal | Strategy |
+|---|---|
+| Best general default — tiny state, smooth pacing | **`gcra`** |
+| Explicit "tokens remaining" count, client-friendly UX | `tokenBucket` |
+| Shape / queue outbound calls to a fixed rate | `leakyBucket` |
+| Cheapest coarse cap, boundary burst is acceptable | `fixedWindow` |
+| Exact "N in the last X" at low limits (e.g. 5/hour) | `slidingWindowLog` |
+| Near-exact rolling window at any limit, bounded memory | `slidingWindow` |
+| Billing-period quotas with calendar-aware resets | `quota` |
+| Protect a service from overload when the right rate is unknown | `adaptiveConcurrency` |
+
+<Tip>
+  When in doubt, start with `gcra`. It stores one number per key, paces traffic smoothly, supports configurable bursts, and has the most efficient Redis Lua implementation of any built-in strategy.
+</Tip>

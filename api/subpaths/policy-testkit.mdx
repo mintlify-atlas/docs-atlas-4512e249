@@ -1,0 +1,352 @@
+---
+title: "Policy Plans and Testkit APIs"
+sidebarTitle: "Policy & Testkit"
+description: "What-If Replay testkit for recording decisions deterministically, plus Policy Plans for a terraform-plan-style current vs candidate limit diff in CI."
+---
+
+ThrottleKit ships two `@experimental` opt-in subpaths for pre-deployment validation: `throttlekit/testkit`
+provides a deterministic decision recorder and replayer, and `throttlekit/policy` builds on it to
+give you a `terraform plan`-style decision diff between your current and candidate policy sets. Both
+are excluded from the `1.x` SemVer guarantee — pin an exact version if you depend on their exact shapes.
+
+## throttlekit/testkit
+
+```ts
+import { recordLimiter, runStoreConformance } from "throttlekit/testkit";
+```
+
+### recordLimiter
+
+Wrap a leaf limiter — built deterministically from a `LimiterSpec` — and record every synchronous
+decision into a bounded `ReplayTrace`. The recording limiter is constructed the same way replay
+does (`MemoryStore`, `sweepIntervalMs: 0`, shared `ManualClock`), so a recording and its replay
+start from the same cold state and evolve identically.
+
+```ts
+function recordLimiter(spec: LimiterSpec, options?: RecordOptions): Recording
+```
+
+<ParamField body="spec" type="LimiterSpec" required>
+  Declarative limiter spec (strategy name + options). The `LimiterSpec` type is from
+  `throttlekit/config`. Only leaf-rate limiters are replayable.
+</ParamField>
+
+<ParamField body="options.clock" type="ManualClock">
+  The `ManualClock` the recording is driven by — advance it between checks to simulate arrivals.
+  Default: a fresh `ManualClock(0)`, exposed as `Recording.clock`. Must be a `ManualClock`.
+</ParamField>
+
+<ParamField body="options.prefix" type="string">
+  Key prefix for the underlying limiter.
+</ParamField>
+
+<ParamField body="options.name" type="string">
+  Config name for error context and labelling. Default `"recorded"`.
+</ParamField>
+
+<ParamField body="options.maxSteps" type="number">
+  Cap on recorded steps. At the cap, recording stops appending: the kept prefix stays a faithful
+  recording but the trace is flagged `truncated` and replay refuses it. Default `1_000_000`.
+</ParamField>
+
+<ParamField body="options.redactKey" type="(key: string) => string">
+  Redact each key at capture so the trace stores only redacted keys. A redaction that maps two
+  distinct keys to the same value throws a `ReplayRefusedError`. Default: identity (no redaction).
+</ParamField>
+
+```ts
+import { recordLimiter } from "throttlekit/testkit";
+import { ManualClock } from "throttlekit";
+
+const clock = new ManualClock(0);
+const rec = recordLimiter(
+  { strategy: "fixedWindow", limit: 10, windowMs: 1_000 },
+  { clock }
+);
+
+// Drive the recording by advancing the clock and making checks
+for (let i = 0; i < 15; i++) {
+  rec.limiter.checkSync("tenant-a");
+  clock.advance(100);
+}
+
+const trace = rec.trace(); // ReplayTrace — the captured decision stream
+```
+
+<ResponseField name="limiter" type="Limiter">
+  The recording limiter. Call `checkSync` / `checkManySync`; each decision appends a step at the
+  clock's current instant. `check`, `checkMany`, and `reset` are refused (`not_implemented`).
+</ResponseField>
+
+<ResponseField name="clock" type="ManualClock">
+  The `ManualClock` driving the recording. Advance it to simulate arrivals.
+</ResponseField>
+
+<ResponseField name="trace" type="() => ReplayTrace">
+  Snapshot the immutable `ReplayTrace` recorded so far.
+</ResponseField>
+
+### runStoreConformance
+
+Register the store-conformance suite under `describe(name)`. Any `Store` implementation passes
+when this suite is green.
+
+```ts
+function runStoreConformance(
+  name: string,
+  setup: () => StoreTestContext | Promise<StoreTestContext>,
+  harness: TestHarness
+): void
+```
+
+```ts
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { runStoreConformance } from "throttlekit/testkit";
+import { MemoryStore, ManualClock } from "throttlekit";
+
+runStoreConformance(
+  "MemoryStore",
+  () => {
+    const clock = new ManualClock(0);
+    return {
+      store: new MemoryStore({ clock, sweepIntervalMs: 0 }),
+      advance: (ms) => clock.advance(ms),
+    };
+  },
+  { describe, it, expect, beforeEach, afterEach }
+);
+```
+
+---
+
+## throttlekit/policy
+
+```ts
+import {
+  policy,
+  policySet,
+  policySetFromConfig,
+  plan,
+  renderPlan,
+  assertPlanAcceptable,
+  corpusFromRecordings,
+  POLICY_SET_FORMAT_VERSION,
+} from "throttlekit/policy";
+```
+
+### policy
+
+Build one `Policy` from a declarative leaf `LimiterSpec`. Validates the spec eagerly via
+`buildStrategy` — an unbuildable leaf throws here.
+
+```ts
+function policy(name: string, spec: LimiterSpec): Policy
+```
+
+<ParamField body="name" type="string" required>
+  Non-empty policy name. Used as the corpus key.
+</ParamField>
+
+<ParamField body="spec" type="LimiterSpec" required>
+  Declarative limiter spec (strategy name + options from `throttlekit/config`).
+</ParamField>
+
+```ts
+const myPolicy = policy("api", { strategy: "gcra", limit: 100, periodMs: 60_000 });
+```
+
+### policySet
+
+Assemble a content-addressed `PolicySet` from an array of `Policy` objects. Refuses duplicate names.
+
+```ts
+function policySet(
+  policies: readonly Policy[],
+  options?: PolicySetOptions
+): PolicySet
+```
+
+<ParamField body="policies" type="Policy[]" required>
+  Array of named policies. All names must be unique.
+</ParamField>
+
+<ParamField body="options.label" type="string">
+  Human-readable label for this set (e.g. `"production"`, `"v2-candidate"`).
+</ParamField>
+
+<ParamField body="options.unreplayable" type="UnreplayablePolicy[]">
+  Non-replayable axes (concurrency / escrow / joint-LP) that exist operationally but cannot be
+  diffed. Listed in the plan as `"not-replayable"` rather than silently omitted.
+</ParamField>
+
+### policySetFromConfig
+
+Build a `PolicySet` from `throttlekit/config` YAML or JSON text. Reads the `limiters` map as
+declarative specs — no live store needed, safe to run in CI.
+
+```ts
+function policySetFromConfig(
+  text: string,
+  options?: PolicySetFromConfigOptions
+): PolicySet
+```
+
+<ParamField body="text" type="string" required>
+  Config file contents as a string (YAML or JSON, auto-detected).
+</ParamField>
+
+<ParamField body="options.label" type="string">
+  Human-readable label.
+</ParamField>
+
+<ParamField body="options.format" type='"yaml" | "json"'>
+  Force a format. Default: auto-detect (text starting with `{`/`[` is JSON, else YAML).
+</ParamField>
+
+### plan
+
+Replay recorded traffic against both the current and candidate policy sets and return the exact
+per-policy, per-key **allow↔deny decision diff**.
+
+```ts
+function plan(
+  current: PolicySet,
+  candidate: PolicySet,
+  corpus: PolicyCorpus,
+  options?: PlanOptions
+): Plan
+```
+
+<ParamField body="current" type="PolicySet" required>
+  The currently deployed policy set. Used as the baseline.
+</ParamField>
+
+<ParamField body="candidate" type="PolicySet" required>
+  The proposed policy set. Diff target.
+</ParamField>
+
+<ParamField body="corpus" type="PolicyCorpus" required>
+  The recorded traffic to replay. Built from `corpusFromRecordings` or `corpusFromTraces`.
+</ParamField>
+
+### renderPlan
+
+Render a `Plan` as a human-readable string for CLI output.
+
+```ts
+function renderPlan(result: Plan, options?: RenderPlanOptions): string
+```
+
+```ts
+const result = plan(current, candidate, corpus);
+console.log(renderPlan(result));
+// "api: 0 allow→deny, 2 deny→allow over 15 decisions"
+```
+
+### assertPlanAcceptable
+
+Assert that a `Plan` passes configured thresholds — the CI gate. Throws `PlanRejectedError`
+(a `ThrottleKitError` with `code: "config_invalid"`) when thresholds are exceeded.
+
+```ts
+function assertPlanAcceptable(result: Plan, options: PlanBudget): void
+```
+
+<ParamField body="options.maxAllowToDeny" type="number">
+  Maximum allow→deny flips permitted (newly blocked traffic). Default `0`.
+</ParamField>
+
+<ParamField body="options.maxDenyToAllow" type="number">
+  Maximum deny→allow flips permitted (newly admitted traffic). Default `Infinity`.
+</ParamField>
+
+```ts
+// CI gate — fail the build if the candidate blocks any previously-allowed traffic
+assertPlanAcceptable(result, { maxAllowToDeny: 0 });
+```
+
+### corpusFromRecordings
+
+Build a `PolicyCorpus` from a map of policy name → `Recording`.
+
+```ts
+function corpusFromRecordings(
+  recordings: Record<string, Recording>
+): PolicyCorpus
+```
+
+### POLICY_SET_FORMAT_VERSION
+
+The current serialization format version. A serialized set from a different version is refused on
+parse.
+
+```ts
+const POLICY_SET_FORMAT_VERSION = 1;
+```
+
+## End-to-End Example
+
+```ts
+import { recordLimiter } from "throttlekit/testkit";
+import {
+  policy,
+  policySet,
+  corpusFromRecordings,
+  plan,
+  renderPlan,
+  assertPlanAcceptable,
+} from "throttlekit/policy";
+import { ManualClock } from "throttlekit";
+
+// 1. Record real traffic against the current limit (limit = 3)
+const clock = new ManualClock(0);
+const rec = recordLimiter(
+  { strategy: "fixedWindow", limit: 3, windowMs: 1_000 },
+  { clock }
+);
+for (let i = 0; i < 6; i++) {
+  rec.limiter.checkSync("tenant-a");
+  clock.advance(50);
+}
+
+// 2. Define current and candidate policy sets
+const current = policySet([
+  policy("api", { strategy: "fixedWindow", limit: 3, windowMs: 1_000 }),
+]);
+const candidate = policySet([
+  policy("api", { strategy: "fixedWindow", limit: 5, windowMs: 1_000 }),
+]);
+
+// 3. Build corpus from the recording
+const corpus = corpusFromRecordings({ api: rec });
+
+// 4. Diff and render
+const result = plan(current, candidate, corpus);
+console.log(renderPlan(result));
+// "api: 0 allow→deny, 2 deny→allow over 6 decisions"
+
+// 5. Assert — zero regressions in CI
+assertPlanAcceptable(result, { maxAllowToDeny: 0 });
+```
+
+## throttlekit/config
+
+The config loader used internally by `policySetFromConfig` and `recordLimiter`. Useful for
+programmatic policy management.
+
+```ts
+import { loadConfig } from "throttlekit/config";
+
+function loadConfig(path: string): Config
+```
+
+<ParamField body="path" type="string" required>
+  Absolute or relative path to a `.throttlekit.yaml` or `.throttlekit.json` config file.
+</ParamField>
+
+```ts
+import { loadConfig } from "throttlekit/config";
+
+const config = loadConfig(".throttlekit.yaml");
+// { limiters: { api: { strategy: "gcra", limit: 100, periodMs: 60_000 } }, ... }
+```

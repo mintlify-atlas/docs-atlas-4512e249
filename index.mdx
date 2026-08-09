@@ -1,20 +1,88 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "ThrottleKit: Rate Limiting You Can Prove"
+sidebarTitle: "Home"
+description: "ThrottleKit is a zero-dependency TypeScript rate-limiting SDK with a 169 ns sync API, TLA⁺-verified distributed leasing, and 13 framework adapters for Node and the web."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+ThrottleKit gives you rate limiting you can reason about precisely — from a 169 ns in-process `checkSync` call to a globally coordinated fleet with a machine-checked overshoot bound. Eight algorithms, six storage backends, and 13 framework adapters share one core and zero runtime dependencies.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a working rate limiter in under two minutes with in-memory GCRA.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install ThrottleKit and choose the peer dependencies you need.
+  </Card>
+  <Card title="Algorithms" icon="code-branch" href="/algorithms/gcra">
+    GCRA, token bucket, fixed/sliding window, leaky bucket, quota, and more.
+  </Card>
+  <Card title="Storage Backends" icon="database" href="/stores/memory">
+    In-memory, Redis, Postgres, DynamoDB, Deno KV, and Cloudflare — bit-identical decisions on all.
+  </Card>
+  <Card title="Framework Adapters" icon="plug" href="/adapters/overview">
+    Drop-in middleware for Express, Fastify, Hono, Next.js, tRPC, gRPC, and more.
+  </Card>
+  <Card title="Distributed Leasing" icon="shield-check" href="/advanced/distributed-leasing">
+    GALE: TLA⁺-verified fleet-size-independent overshoot bound for high-throughput fleets.
+  </Card>
+  <Card title="Unified Admission" icon="filter" href="/advanced/unified-admission">
+    Compose rate, concurrency, and cost into a single decision — including LLM token budgets.
+  </Card>
+  <Card title="API Reference" icon="book" href="/api/rate-limit">
+    Complete reference for every export, type signature, and option.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## Why ThrottleKit
+
+Most rate limiters just count requests. ThrottleKit governs three axes — **rate**, **concurrency**, and **cost** — and gives you a provable bound on each.
+
+<CardGroup cols={3}>
+  <Card title="169 ns Sync API" icon="bolt">
+    `checkSync` returns a full `Decision` in 169 ns with ~0 allocations. A true synchronous hot path, no `await` needed.
+  </Card>
+  <Card title="Proven Bit-Identical" icon="check-double">
+    The same GCRA runs in JS and Redis Lua. A conformance suite with thousands of generated timelines proves both paths agree exactly.
+  </Card>
+  <Card title="Zero Runtime Deps" icon="feather">
+    24 tree-shakeable subpath exports. Install only the peer deps your stores and adapters actually need.
+  </Card>
+</CardGroup>
+
+## Get Started in 30 Seconds
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+});
+
+const decision = limiter.checkSync(userId);
+if (!decision.allowed) {
+  throw new Error(`Rate limited — retry in ${decision.retryAfterMs}ms`);
+}
+```
+
+Every check returns a `Decision` with `{ allowed, limit, remaining, resetAt, retryAfterMs }`. No magic, no surprises.
+
+<Steps>
+  <Step title="Install">
+    ```bash
+    npm install throttlekit
+    ```
+  </Step>
+  <Step title="Create a limiter">
+    Pick a strategy and call `rateLimit()`. The default in-memory store requires no infrastructure.
+  </Step>
+  <Step title="Check every request">
+    Call `limiter.checkSync(key)` on hot synchronous paths or `await limiter.check(key)` anywhere else.
+  </Step>
+  <Step title="Go distributed">
+    Swap in a `RedisStore`, `PostgresStore`, or use `twoTier()` for leased local-first limiting with a bounded global overshoot.
+  </Step>
+</Steps>
+
+<Note>
+  ThrottleKit requires **Node 18+** for the in-memory and fetch-based paths. Redis, Postgres, DynamoDB, Deno KV, and Cloudflare adapters require their respective optional peer dependencies.
+</Note>

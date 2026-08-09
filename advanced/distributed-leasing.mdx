@@ -1,0 +1,289 @@
+---
+title: "Distributed Leasing"
+sidebarTitle: "Distributed Leasing"
+description: "GALE's provable two-tier engine: serve token batches locally from a distributed store with a hard, fleet-size-independent overshoot bound."
+---
+
+ThrottleKit's distributed engine — **GALE** (provable leasing) — lets a fleet of nodes share one global limit without paying a network round trip on every request. A local in-process tier (L1) fronts a distributed store (L2), and the coordination strategy is selectable per limiter. The headline mode, `leased`, collapses steady-state network cost to roughly one round trip per `batch` requests while keeping a provable bound on how far total admissions can exceed the limit.
+
+## The `twoTier()` API
+
+```ts
+import { twoTier } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+import { gcra } from "throttlekit";
+
+const limiter = twoTier({
+  strategy: gcra({ limit: 10_000, periodMs: 60_000, burst: 500 }),
+  l2: new RedisStore({ client: redis }),
+  mode: "leased",
+  lease: { batch: 50, windowCoupled: true },
+});
+
+const decision = await limiter.check("tenant-1");
+```
+
+`twoTier` returns a standard `Limiter` — the same `check` / `checkMany` / `reset` interface every other limiter implements. `checkSync` is **not** supported in any mode (L2 access is asynchronous by design); calling it throws.
+
+### `TwoTierOptions`
+
+<ParamField path="strategy" type="Strategy" required>
+  The algorithm enforced at L2 (e.g. `gcra`, `fixedWindow`, `tokenBucket`). Also defines the unit of the leased budget.
+</ParamField>
+
+<ParamField path="l2" type="Store" required>
+  The distributed backing store, such as `RedisStore` from `throttlekit/redis`.
+</ParamField>
+
+<ParamField path="mode" type="TwoTierMode" required>
+  Coordination mode: `"strict"` | `"cached-deny"` | `"leased"`. See the comparison table below.
+</ParamField>
+
+<ParamField path="lease" type="LeaseOptions">
+  Required when `mode` is `"leased"`. Configures how credits are batched and managed locally.
+</ParamField>
+
+<ParamField path="l1" type="L1Options">
+  Local-tier tuning, including `maxKeys` to bound the in-process maps on public endpoints.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Injected time source. Defaults to the system clock. Use `ManualClock` in tests.
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Key namespace prepended to every store key.
+</ParamField>
+
+---
+
+## The Three Modes
+
+| Mode | Network cost | Accuracy | Use case |
+|---|---|---|---|
+| `strict` | 1 RTT / request | Exact | Hard quotas, billing |
+| `cached-deny` | 1 RTT / **allowed** request; 0 for blocked keys | Exact allows; cached denials | Public APIs — protect L2 from flood amplification |
+| `leased` | ~1 RTT / `batch` requests | Bounded overshoot (≤ `Limit + N×(Batch−1)`; exactly `Limit` with `windowCoupled`) | High-throughput hot keys |
+
+<Note>
+`cached-deny` is the "protect the protector" mode: an abusive client flooding a blocked key cannot translate its flood into L2 load, because the denial is served from L1 cache.
+</Note>
+
+---
+
+## Lease Options
+
+<ParamField path="batch" type="number">
+  Tokens leased from L2 per refill. Larger batch ⇒ fewer round trips but a wider overshoot window. Required unless `adaptive` is set (with adaptive sizing, `batch` is an optional warm-start hint).
+</ParamField>
+
+<ParamField path="lowWater" type="number">
+  When local credits fall to this level, trigger a proactive background refill so requests never block on the network. Default `0` (disabled; purely lease-on-demand). Setting `lowWater > 0` hides lease latency at the cost of a slightly looser overshoot bound.
+</ParamField>
+
+<ParamField path="returnIdleAfterMs" type="number">
+  Drop a key's idle local credits after this many milliseconds. The capacity self-heals via L2 on the next check. Useful with `l1.maxKeys` to bound memory on endpoints with high key churn.
+</ParamField>
+
+<ParamField path="windowCoupled" type="boolean">
+  When `true`, leased credits expire when the L2 window rolls (`now >= lastDecision.resetAt`) rather than carrying over into the next window. This removes the **sole** source of cross-window overshoot and tightens the global per-window bound from `Limit + N×(Batch−1)` to exactly `Limit`, independent of the node count `N`. Intended for fixed-window L2 strategies (the case proven in `spec/GaleWindowCoupledLeasing.tla`). Default `false`.
+</ParamField>
+
+<ParamField path="adaptive" type="LeaseSizerOptions | (() => LeaseSizer)">
+  Enable **adaptive (online) lease sizing** — GALE Pillar 2. Instead of a fixed `batch`, each key's batch is sized online by a `leaseSizer` that observes demand each window and adjusts toward the EOQ optimum. Safety is independent of the size the learner emits.
+</ParamField>
+
+---
+
+## Formal Guarantee
+
+The baseline leased mode (no `windowCoupled`) satisfies:
+
+```
+admitted_per_window ≤ Limit + N × (Batch − 1)
+```
+
+where `N` is the number of nodes in the fleet. This bound is machine-checked in `spec/DistributedLeasing.tla` (TLC-verified).
+
+With `windowCoupled: true`, the carryover term disappears:
+
+```
+admitted_per_window ≤ Limit   (for any N)
+```
+
+This is proven in `spec/GaleWindowCoupledLeasing.tla` and reproduced by an exhaustive BFS twin that runs in CI for `N ∈ {1, 2, 4, 8}`.
+
+<Note>
+**TLA⁺ verification.** Both bounds are model-checked with TLC. The window-coupled invariant `MaxAdmitted == Limit` holds for every reachable state across all tested fleet sizes. The baseline bound is also checked for tightness (an intentionally-false invariant confirms it is exact, not conservative).
+</Note>
+
+---
+
+## Basic Example
+
+```ts
+import { ManualClock, MemoryStore, gcra, twoTier } from "throttlekit";
+
+const clock = new ManualClock(0);
+// In production: new RedisStore({ client: new Redis(url) })
+const l2 = new MemoryStore({ clock });
+
+const limiter = twoTier({
+  strategy: gcra({ limit: 10_000, periodMs: 60_000, burst: 500 }),
+  l2,
+  mode: "leased",
+  lease: { batch: 50 },
+  clock,
+});
+
+// First check leases a batch from L2 (one round trip).
+// The next 49 checks are served from local credits — zero network.
+let allowed = 0;
+for (let i = 0; i < 60; i++) {
+  const d = await limiter.check("tenant-1");
+  if (d.allowed) allowed++;
+}
+console.log("allowed of 60:", allowed); // 60 — well within the 500-burst budget
+```
+
+---
+
+## Adaptive Lease Sizing (GALE Pillar 2)
+
+Choosing a fixed `batch` is a manual trade-off: too small means many L2 round trips, too large means wasted (stranded) capacity at each window boundary. The `adaptive` option delegates this choice to an online learner.
+
+The `leaseSizer` minimizes the **Economic Order Quantity** cost:
+
+```
+f_D(b) = orderCost × D / b  +  strandPenalty × b / 2
+```
+
+whose optimum is `b* = √(2 × orderCost × D / strandPenalty)`. Because per-key demand `D` drifts, the learner runs **AdaGrad in log-space**, attaining `O(√T)` regret against the best fixed batch in hindsight. One independent learner is maintained per key; it is fed the window's served demand each time the L2 window rolls.
+
+```ts
+import {
+  ManualClock,
+  MemoryStore,
+  fixedWindow,
+  twoTier,
+} from "throttlekit";
+
+const clock = new ManualClock(0);
+const l2 = new MemoryStore({ clock });
+
+const limiter = twoTier({
+  strategy: fixedWindow({ limit: 1_000_000, windowMs: 60_000 }),
+  l2,
+  mode: "leased",
+  lease: {
+    windowCoupled: true,
+    // High orderCost → learner prefers larger batches;
+    // start small so the growth is visible.
+    adaptive: {
+      orderCost: 200,
+      strandPenalty: 1,
+      initialSize: 4,
+      maxSize: 1000,
+    },
+  },
+  clock,
+});
+```
+
+You can also call `eoqOptimum(orderCost, strandPenalty, demand)` directly to compute a one-shot optimal batch when demand is known in advance, or construct a `leaseSizer` manually and drive it yourself.
+
+<Tip>
+Safety is completely decoupled from the learner. GALE Pillar 1 enforces the global cap for **any** batch the adaptive sizer emits, so enabling `adaptive` cannot loosen the overshoot bound — it only trades coordination frequency against stranded capacity.
+</Tip>
+
+---
+
+## Weighted Fair Escrow
+
+When the shared budget is contested, `weightedFairEscrow` splits it across tenants in **weighted-max-min-fair** proportion. Under skewed demand, idle tenants' shares flow to backlogged ones proportionally to weight; every backlogged tenant receives at least its guaranteed weighted floor `⌊wᵢ × L / W⌋`.
+
+```ts
+import { ManualClock, weightedFairEscrow } from "throttlekit";
+
+const escrow = weightedFairEscrow({
+  limit: 30_000,         // tokens per window
+  windowMs: 60_000,
+  weightOf: (tenant) => ({
+    enterprise: 4,
+    pro: 2,
+    free: 1,
+  }[tenant.split(":")[0]] ?? 1),
+  l1: { maxKeys: 1024 },
+  clock,
+});
+
+const d = escrow.checkSync("enterprise:alpha", 1_000);
+```
+
+For multi-region deployments, `federatedWeightedFairEscrow` composes two levels of this primitive: per-region tenant WFE within each region, composed through a shared `regionFairPool` (a WFE over regions) into a global weighted-max-min guarantee. The `RedisRegionFairPool` is the production store-backed cross-region pool.
+
+```ts
+import { federatedWeightedFairEscrow, RedisRegionFairPool } from "throttlekit";
+
+const pool = new RedisRegionFairPool({
+  client: redis,
+  regions: ["us-east", "eu-west", "ap-south"],
+  windowMs: 60_000,
+});
+
+const fedEscrow = federatedWeightedFairEscrow({
+  limit: 100_000,
+  windowMs: 60_000,
+  regionId: "us-east",
+  regionFairPool: pool,
+  weightOf: (tenant) => tenantWeight(tenant),
+});
+```
+
+---
+
+## Failure Behavior During L2 Outage
+
+When an L2 call fails (network error, Redis unavailability), the lease path follows a **fail-closed** discipline:
+
+- Local credits that were already leased continue to serve requests normally.
+- On a shortage, the in-flight lease promise rejects; the credits remain unchanged (no partial credit added).
+- The next check re-attempts an L2 lease synchronously (no background retry loop).
+- If L2 returns a denial (globally exhausted budget), that denial is surfaced verbatim to the caller.
+
+<Warning>
+`lowWater > 0` fires proactive background refills; a failed background refill is silently discarded (fire-and-forget). Only on-demand leases (triggered by a shortage) surface their errors. Set `l1.maxKeys` on public endpoints to bound local state even when L2 is unavailable for extended periods.
+</Warning>
+
+---
+
+## `LeaseSpender` — Tier-2 Client-Side Leasing
+
+When the distributed engine runs behind the ThrottleKit gRPC service rather than a directly-accessible Redis, a client can lease a chunk of the global budget over one RPC and serve requests locally. `LeaseSpender` implements the client-side spend: it is a direct port of the `twoTier(leased, windowCoupled)` L1 path.
+
+```ts
+import { LeaseSpender } from "throttlekit";
+
+const spender = new LeaseSpender({
+  windowMs: 60_000,
+  // `reserve` calls the gRPC Fleet.Reserve endpoint
+  reserve: async (wants) => grpcClient.reserve({ wants }),
+});
+
+const result = spender.spend(now, "tenant-1", 1);
+if (result.type === "allow") {
+  // serve locally
+} else if (result.type === "needs-refresh") {
+  // refill from the server, then retry
+}
+```
+
+`LeaseSpender.spend` is pure and synchronous (time is injected per call), running at ≈10 ns/op.
+
+<Accordion title="FAQ: Why can't I use checkSync on a two-tier limiter?">
+L2 access is inherently asynchronous (a network call to Redis or another store). The `checkSync` method on the returned `Limiter` always throws a `ThrottleKitError` by design. If you need synchronous behavior at the local tier, consider `mode: "cached-deny"` with a very low-latency L2, or run a purely in-process limiter for the fast path and gate on the two-tier limiter asynchronously for enforcement.
+</Accordion>
+
+<Accordion title="FAQ: Does window-coupling affect GCRA or token-bucket strategies?">
+`windowCoupled` is most meaningful with fixed-window strategies (like `fixedWindow`) that have a discrete window boundary. GCRA and token-bucket use a virtual arrival time / refill model without a hard reset, so they participate in leasing but do not benefit from window-coupling's overshoot elimination in the same way. The bound for those strategies remains `≤ Limit + N×(Batch−1)` regardless.
+</Accordion>

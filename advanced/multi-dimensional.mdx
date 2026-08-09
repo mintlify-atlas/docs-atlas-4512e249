@@ -1,0 +1,192 @@
+---
+title: "Multi-Dimensional Rate Limiting"
+sidebarTitle: "Multi-Dimensional"
+description: "Enforce per-IP, per-user, and per-route limits atomically in one decision with multiRateLimit(), all(), and any() — fused into one Redis round trip."
+---
+
+Most production APIs need to enforce several independent constraints at once — a per-IP limit, a per-user quota, and a per-route ceiling — and they must be atomic: you cannot allow a request against the per-IP dimension and then separately deny it on the per-user dimension, because state would already be consumed. `multiRateLimit` evaluates all configured dimensions together in one atomic step, committing state only when the combined decision is "allow."
+
+On a Redis store, every dimension is evaluated in a **single Lua round trip** — regardless of how many dimensions you configure. On an in-process synchronous store, all dimensions are read, the decision is computed, and state is committed in one uninterrupted synchronous turn with no partial-consume risk.
+
+## `multiRateLimit()`
+
+```ts
+import { multiRateLimit, all, any, gcra, fixedWindow } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+
+interface Ctx {
+  ip: string;
+  userId: string;
+  route: string;
+}
+
+const limiter = multiRateLimit<Ctx>({
+  store: new RedisStore({ client: redis }),
+  strategy: all<Ctx>({
+    ip:    { key: (c) => c.ip,     strategy: gcra({ limit: 100,   periodMs: 60_000 }) },
+    user:  { key: (c) => c.userId, strategy: gcra({ limit: 1_000, periodMs: 60_000 }) },
+    route: { key: (c) => c.route,  strategy: fixedWindow({ limit: 3, windowMs: 1_000 }) },
+  }),
+});
+
+const decision = await limiter.check({ ip: "203.0.113.7", userId: "u42", route: "/search" });
+```
+
+### `MultiRateLimitOptions`
+
+<ParamField path="strategy" type="MultiStrategy<Ctx>" required>
+  A composite built with `all()` or `any()`. Specifies the dimensions and combine mode.
+</ParamField>
+
+<ParamField path="store" type="Store">
+  The backing store. Defaults to a new `MemoryStore`. For Redis, every dimension is fused into a single atomic Lua script.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Injected time source. Defaults to the system clock.
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Key namespace prepended to every dimension's store key.
+</ParamField>
+
+---
+
+## `Dimension` and `Dimensions`
+
+Each dimension specifies how to derive its key from the request context, which algorithm to enforce, and an optional per-dimension cost weight:
+
+```ts
+interface Dimension<Ctx, S = unknown> {
+  key:     (ctx: Ctx) => string;   // extract this dimension's key from the request
+  strategy: Strategy<S>;            // algorithm to enforce (gcra, fixedWindow, tokenBucket)
+  cost?:   (ctx: Ctx) => number;   // per-dimension cost multiplier; default 1
+}
+
+type Dimensions<Ctx> = Record<string, Dimension<Ctx>>;
+```
+
+Dimension names (the keys of the `Dimensions` record) become part of the Redis key namespace: `{prefix}:{name}:{raw-key}`.
+
+---
+
+## `all()` — Every Dimension Must Pass
+
+`all(dimensions)` builds a `MultiStrategy` where a request is **allowed only if every dimension allows**. If any dimension denies, no state is consumed for any dimension — zero partial-consume.
+
+On allow, the combined `Decision` reflects the **binding dimension**: the one with the lowest `remaining` (the tightest headroom). On deny, it reflects the dimension with the largest `retryAfterMs` (the longest you must wait before all constraints are satisfied simultaneously).
+
+```ts
+const limiter = multiRateLimit<Ctx>({
+  strategy: all<Ctx>({
+    ip:   { key: (c) => c.ip,   strategy: gcra({ limit: 100, periodMs: 60_000 }) },
+    user: { key: (c) => c.userId, strategy: gcra({ limit: 500, periodMs: 60_000 }) },
+  }),
+});
+```
+
+---
+
+## `any()` — At Least One Dimension Must Pass
+
+`any(dimensions)` allows a request if **at least one dimension allows**. State is consumed only for the dimensions that individually allowed — denied dimensions are not decremented.
+
+On allow, the combined `Decision` reflects the dimension with the most `remaining`. On deny (all dimensions failed), it reflects the dimension with the smallest `retryAfterMs` (soonest recovery).
+
+```ts
+// Serve from any available regional quota — useful for burst allowances
+const limiter = multiRateLimit<Ctx>({
+  strategy: any<Ctx>({
+    burst:   { key: (c) => c.userId, strategy: tokenBucket({ capacity: 10, refillPerSec: 1 }) },
+    monthly: { key: (c) => c.userId, strategy: fixedWindow({ limit: 1_000, windowMs: 2_592_000_000 }) },
+  }),
+});
+```
+
+---
+
+## `combineDecisions`
+
+The decision-combination logic is not hidden inside `multiRateLimit` — it is the same exported `combineDecisions` primitive used by `unifiedAdmission`. You can use it directly when combining independently-checked decisions in application code:
+
+```ts
+import { combineDecisions } from "throttlekit";
+
+const combined = combineDecisions(ipDecision, userDecision);
+// combined.allowed = ipDecision.allowed && userDecision.allowed
+// combined.remaining = min(...)  combined.retryAfterMs = max(...)
+```
+
+---
+
+## `MultiLimiter` Interface
+
+```ts
+interface MultiLimiter<Ctx> {
+  check(ctx: Ctx, cost?: number): Promise<Decision>;
+  checkSync(ctx: Ctx, cost?: number): Decision; // sync stores only
+  reset(ctx: Ctx): Promise<void>;
+}
+```
+
+`checkSync` requires a synchronous store (e.g. `MemoryStore`). On an async store it throws. `reset` deletes the keys for all dimensions for the given context.
+
+---
+
+## Full Example
+
+```ts
+import { ManualClock, MemoryStore, all, fixedWindow, gcra, multiRateLimit } from "throttlekit";
+
+interface Ctx {
+  ip: string;
+  userId: string;
+  route: string;
+}
+
+const clock = new ManualClock(0);
+
+const limiter = multiRateLimit<Ctx>({
+  clock,
+  store: new MemoryStore({ clock }),
+  strategy: all<Ctx>({
+    ip:    { key: (c) => c.ip,     strategy: gcra({ limit: 100, periodMs: 60_000 }) },
+    user:  { key: (c) => c.userId, strategy: gcra({ limit: 1_000, periodMs: 60_000 }) },
+    // Tight per-route window: only 3 requests per second
+    route: { key: (c) => c.route,  strategy: fixedWindow({ limit: 3, windowMs: 1_000 }) },
+  }),
+});
+
+const ctx: Ctx = { ip: "203.0.113.7", userId: "user-42", route: "/search" };
+
+// The route window (limit 3) is the binding constraint.
+// The 4th request in the same second is denied, and NO dimension is consumed on that denied check.
+for (let i = 1; i <= 4; i++) {
+  const d = await limiter.check(ctx);
+  console.log(`#${i} allowed:`, d.allowed, "remaining:", d.remaining, "retryAfterMs:", d.retryAfterMs);
+}
+
+// checkSync works on a MemoryStore
+const sync = limiter.checkSync({ ip: "203.0.113.8", userId: "user-7", route: "/profile" });
+console.log("sync allowed:", sync.allowed);
+```
+
+---
+
+## Performance: Single Round Trip
+
+When using a Redis store, `multiRateLimit` fuses all dimensions into a **single Lua `EVAL` call**. The script evaluates GCRA, token-bucket, and fixed-window dimensions in one pass, applies the combine rule in Lua, and commits state (all-or-none per mode) atomically in that same script. You pay **one round trip** regardless of the number of dimensions configured.
+
+On a synchronous store, all dimensions are read in a single uninterrupted JavaScript turn, the decision is computed, and state is committed — also with no interleaving risk.
+
+<Note>
+The Lua fused path supports `gcra`, `tokenBucket`, and `fixedWindow` dimensions. Configuring a dimension with a different strategy on an async (Redis) store will throw at the first `check()` call. On a sync store (`MemoryStore`), any strategy is supported.
+</Note>
+
+<Accordion title="FAQ: What happens on a partial failure — if one dimension's key doesn't exist in Redis?">
+The Lua script handles absent state by treating it as the initial state for that strategy (e.g. zero usage for a fixed-window counter). The all-or-none commit means either all allowing dimensions are updated atomically, or none are — you cannot observe a state where two dimensions were updated but a third was not.
+</Accordion>
+
+<Accordion title="FAQ: Can I mix Redis and in-process dimensions?">
+No. `multiRateLimit` uses a single `store` for all dimensions. If you need axes from different stores, compose them with `unifiedAdmission` (rate + concurrency + cost axes each with their own store) or chain separate limiters manually. `multiRateLimit` is designed for the case where all dimensions share the same store and you want them fused into one atomic round trip.
+</Accordion>

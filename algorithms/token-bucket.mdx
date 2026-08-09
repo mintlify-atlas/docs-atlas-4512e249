@@ -1,0 +1,102 @@
+---
+title: "Token Bucket"
+sidebarTitle: "Token Bucket"
+description: "Discrete tokens refilled at a fixed rate per second. Exposes an explicit token count — the best choice when client-visible 'tokens remaining' matters."
+---
+
+The token bucket strategy maintains a bucket of discrete tokens that refills continuously at `refillPerSec` tokens per second. A request is admitted when at least `cost` tokens are present; those tokens are then consumed. When the bucket is empty (or below `cost`), the request is denied and nothing is consumed.
+
+The bucket is *lazily* refilled — there is no background timer. On each check, ThrottleKit computes the elapsed time since the last refill, calculates how many tokens have accumulated, and clamps the total to `capacity`. This means refill is free unless a request arrives, and the bucket always starts full on a cold key.
+
+## Options
+
+<ParamField path="capacity" type="number" required>
+  The bucket capacity: the maximum number of tokens the bucket can hold, and the largest instantaneous burst a cold key can absorb. When a key has been idle long enough for the bucket to fill completely, the first `capacity` units of cost are admitted without any pacing delay.
+</ParamField>
+
+<ParamField path="refillPerSec" type="number" required>
+  The sustained refill rate in tokens per second. Fractional values are accepted (e.g., `0.5` for one token every two seconds). Together with `capacity`, this determines how long a depleted bucket takes to refill: `capacity / (refillPerSec / 1000)` milliseconds.
+</ParamField>
+
+## State shape
+
+The token bucket maintains two values per key:
+
+- **`tokens`** — the current token count (fractional; lazily brought current on each check).
+- **`last`** — the epoch-ms timestamp of when `tokens` was last updated.
+
+This two-field state is stored in a Redis `HASH` (`t` and `l` fields) so it round-trips exactly using `%.17g` precision.
+
+## Code example
+
+```ts
+import { rateLimit, tokenBucket } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: tokenBucket({
+    capacity: 50,       // bucket holds up to 50 tokens
+    refillPerSec: 10,   // refills 10 tokens/second (one every 100ms)
+  }),
+});
+
+// Check a single request (cost = 1 by default)
+const decision = await limiter.check("user-42");
+console.log(
+  "allowed:", decision.allowed,
+  "remaining:", decision.remaining,     // explicit token count
+  "resetAt:", new Date(decision.resetAt).toISOString(),
+);
+
+// Bulk operation consuming multiple tokens at once
+const bulk = await limiter.check("user-42", 10);
+if (!bulk.allowed) {
+  console.log(`need 10 tokens; retry in ${bulk.retryAfterMs}ms`);
+}
+```
+
+### With a deterministic clock
+
+```ts
+import { rateLimit, tokenBucket, ManualClock, MemoryStore } from "throttlekit";
+
+const clock = new ManualClock(0);
+const limiter = rateLimit({
+  strategy: tokenBucket({ capacity: 5, refillPerSec: 1 }),
+  clock,
+  store: new MemoryStore({ clock }),
+});
+
+// Cold key starts full
+console.log(limiter.checkSync("k").remaining); // 4 (5 capacity − 1 consumed)
+
+// Advance 2 seconds → 2 tokens refilled
+clock.advance(2_000);
+console.log(limiter.checkSync("k").remaining); // 5 (4 + 2, clamped to capacity)
+```
+
+## Token bucket vs GCRA
+
+Both token bucket and GCRA produce equivalent admission decisions, but they differ in what they surface and store:
+
+| | Token Bucket | GCRA |
+|---|---|---|
+| State per key | `{ tokens, last }` (two floats) | One float (TAT) |
+| `remaining` field | **Explicit token count** | Derived from TAT math |
+| Cold key behavior | Starts full (`capacity` tokens) | Admits `burst` requests instantly |
+| Wire footprint | Redis `HASH` (two fields) | Redis `GET`/`SET` (one value) |
+
+The explicit `remaining` value is the primary reason to choose token bucket over GCRA. When you surface remaining quota in API response headers (e.g., `X-RateLimit-Remaining`) and want clients to see a concrete token count rather than a derived estimate, token bucket makes that count directly available.
+
+<Note>
+  A denied request never consumes tokens. `remaining` stays accurate across repeated denials, so clients can rely on it for backoff calculations.
+</Note>
+
+## When to use token bucket
+
+- **Client-facing APIs** where surfacing a concrete "tokens remaining" count in headers is important for client UX.
+- **Burst absorption with explicit visibility** — when you want both a capacity cap and transparent reporting of how much headroom is left.
+- **Controlled bursts** — when you want to distinguish "bucket empty right now" from "fully refilled" in client-side logic.
+
+<Tip>
+  If you don't need the explicit token count and want the smallest possible state, use [GCRA](/algorithms/gcra) instead. GCRA is mathematically equivalent and stores one float instead of two.
+</Tip>

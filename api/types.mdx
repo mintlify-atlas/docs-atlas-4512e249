@@ -1,0 +1,518 @@
+---
+title: "Core Types and Interfaces"
+sidebarTitle: "Types"
+description: "Complete reference for every type and interface in ThrottleKit: Decision, Strategy, Store, Limiter, Clock, errors, combineDecisions, and security helpers."
+---
+
+This page documents the complete set of types that form ThrottleKit's stable API surface. All types
+are exported from the top-level `throttlekit` package. They are designed for extensibility:
+**producer types** (values the library returns) grow only by appending optional `readonly` fields;
+**consumer interfaces** (contracts you implement) grow only by adding optional members.
+
+## Decision
+
+The immutable result of one rate-limit check. Every check method returns a `Decision`.
+
+All numeric fields are integers so the JavaScript and Redis-Lua execution paths produce bit-identical
+values.
+
+```ts
+import type { Decision } from "throttlekit";
+```
+
+<ResponseField name="allowed" type="boolean">
+  Whether the request is permitted.
+</ResponseField>
+
+<ResponseField name="limit" type="number">
+  The effective ceiling: burst capacity (GCRA/token bucket) or window quota.
+</ResponseField>
+
+<ResponseField name="remaining" type="number">
+  Whole units remaining before the next rejection. Never negative.
+</ResponseField>
+
+<ResponseField name="resetAt" type="number">
+  Epoch-ms at which the limiter is fully replenished.
+</ResponseField>
+
+<ResponseField name="retryAfterMs" type="number">
+  Milliseconds to wait before retrying. `0` when `allowed` is `true`.
+</ResponseField>
+
+## Forecast
+
+A non-consuming projection of a key's near-future capacity. Returned by `Limiter.forecast()`.
+
+```ts
+import type { Forecast } from "throttlekit";
+```
+
+<ResponseField name="spendableNow" type="number">
+  Whole units of the given `cost` admissible right now before the next denial.
+</ResponseField>
+
+<ResponseField name="nextReplenishAt" type="number">
+  Epoch-ms when capacity next increases by at least one unit.
+</ResponseField>
+
+<ResponseField name="fullAt" type="number">
+  Epoch-ms when the limiter is fully replenished to its ceiling from the current state.
+</ResponseField>
+
+## Strategy\<S\>
+
+A pure rate-limiting algorithm over serializable state `S`. The `check` function is a pure function
+of `(state, now, cost)` — no I/O, no clock reads — which makes it deterministic, trivially testable,
+and portable to an atomic Redis Lua form.
+
+```ts
+import type { Strategy } from "throttlekit";
+```
+
+<ResponseField name="name" type="string" required>
+  Stable identifier surfaced in `RateLimit-Policy` and metrics (e.g. `"gcra"`).
+</ResponseField>
+
+<ResponseField name="limit" type="number" required>
+  Effective ceiling reported to clients (burst capacity or window quota).
+</ResponseField>
+
+<ResponseField name="windowMs" type="number">
+  Effective window length in ms, surfaced as the `w` of `RateLimit-Policy`. Optional.
+</ResponseField>
+
+<ResponseField name="ttlMs" type="number" required>
+  Upper bound on how long state stays relevant; used as the store TTL hint.
+</ResponseField>
+
+<ResponseField name="check" type="(state: S | undefined, now: number, cost: number) => StrategyOutcome<S>" required>
+  The pure transition. Given the current state, epoch-ms `now`, and request `cost`, returns the next
+  state and the resulting `Decision`.
+</ResponseField>
+
+<ResponseField name="lua" type="LuaProgram">
+  Optional atomic Redis form. When present, a Lua-capable store runs it in one round trip.
+</ResponseField>
+
+<ResponseField name="peek" type="(state: S | undefined, now: number) => Decision">
+  Pure, non-mutating introspection: the `Decision` for the current state without consuming. Optional.
+  The basis of `Limiter.peek`.
+</ResponseField>
+
+<ResponseField name="forecast" type="(state: S | undefined, now: number, cost: number) => Forecast">
+  Pure capacity forecast for the current state. Optional. The basis of `Limiter.forecast`.
+</ResponseField>
+
+<ResponseField name="readState" type="ReadState<S>">
+  Read-only access to stored state for a Lua-capable store. Required for `peek`/`forecast` to work
+  over a Lua store.
+</ResponseField>
+
+## Store
+
+Storage exposes exactly one mutating primitive: `apply`. Adding a backend means implementing one
+method; adding an algorithm never touches a store.
+
+```ts
+import type { Store } from "throttlekit";
+```
+
+<ResponseField name="apply" type="(key: string, transform: Transform<S, R>) => Promise<R>" required>
+  Run `transform` atomically with respect to other applies on the same key.
+</ResponseField>
+
+<ResponseField name="applySync" type="(key: string, transform: Transform<S, R>, now?: number) => R">
+  Synchronous, allocation-light variant. Absent on async-only stores (e.g. `RedisStore`). When
+  present, enables `checkSync`, `checkManySync`, `peekSync`, and `forecastSync` on the limiter.
+</ResponseField>
+
+<ResponseField name="reset" type="(key: string) => Promise<void>" required>
+  Forget a key's stored state.
+</ResponseField>
+
+<ResponseField name="resetSync" type="(key: string) => void">
+  Synchronous reset. Optional; only on stores that can guarantee synchronous deletion.
+</ResponseField>
+
+<ResponseField name="close" type="() => Promise<void>">
+  Release resources (timers, connections). Optional.
+</ResponseField>
+
+## Limiter
+
+A constructed limiter: a strategy + store + key namespace + clock. Returned by `rateLimit()`,
+`twoTier()`, and every higher-level factory.
+
+```ts
+import type { Limiter } from "throttlekit";
+```
+
+<ResponseField name="strategy" type="Strategy">
+  The active strategy. Use `limiter.strategy.name` for headers/policy labelling.
+</ResponseField>
+
+<ResponseField name="check" type="(key: string, cost?: number) => Promise<Decision>" required>
+  Check `key` consuming `cost` units (default `1`).
+</ResponseField>
+
+<ResponseField name="checkSync" type="(key: string, cost?: number) => Decision" required>
+  Zero-`await` synchronous check. Throws `ThrottleKitError` on an async-only store.
+</ResponseField>
+
+<ResponseField name="checkMany" type="(keys: readonly string[], cost?: number) => Promise<Decision[]>" required>
+  Check many independent keys in one call at a single consistent timestamp.
+</ResponseField>
+
+<ResponseField name="checkManySync" type="(keys: readonly string[], cost?: number) => Decision[]" required>
+  Synchronous batch check. Throws on an async-only store.
+</ResponseField>
+
+<ResponseField name="peek" type="(key: string) => Promise<Decision>">
+  Non-consuming introspection without spending capacity. Optional.
+</ResponseField>
+
+<ResponseField name="peekSync" type="(key: string) => Decision">
+  Synchronous `peek`. Requires a synchronous store and a strategy that implements `peek`. Optional.
+</ResponseField>
+
+<ResponseField name="forecast" type="(key: string, cost?: number) => Promise<Forecast>">
+  Non-consuming capacity forecast. Optional.
+</ResponseField>
+
+<ResponseField name="forecastSync" type="(key: string, cost?: number) => Forecast">
+  Synchronous `forecast`. Optional.
+</ResponseField>
+
+<ResponseField name="reset" type="(key: string) => Promise<void>" required>
+  Forget a key's state.
+</ResponseField>
+
+<ResponseField name="close" type="() => Promise<void>">
+  Release resources owned by this limiter. Optional.
+</ResponseField>
+
+## Transform\<S, R\>
+
+A pure read-modify-write run atomically by a store. Closes over `now` and `cost`.
+
+```ts
+type Transform<S, R> = ((state: S | undefined) => ApplyOutcome<S, R>) & {
+  readonly lua?: LuaInvocation<R>;
+};
+```
+
+The optional `lua` property carries an atomic acceleration for Lua-capable stores. Stores that
+ignore it remain correct via the function body.
+
+## ApplyOutcome\<S, R\>
+
+The outcome of a store `apply`: new state + caller's result + persistence info.
+
+<ResponseField name="state" type="S | undefined">
+  Next state. Written when `persist` is `true`.
+</ResponseField>
+
+<ResponseField name="result" type="R">
+  Value returned to the caller (a `Decision` for rate-limit checks).
+</ResponseField>
+
+<ResponseField name="ttlMs" type="number">
+  TTL for the persisted state, in ms.
+</ResponseField>
+
+<ResponseField name="persist" type="boolean">
+  Whether state must be written to the store.
+</ResponseField>
+
+## StrategyOutcome\<S\>
+
+What a `Strategy` returns from a single transition. An alias for `ApplyOutcome<S, Decision>`.
+
+```ts
+type StrategyOutcome<S> = ApplyOutcome<S, Decision>;
+```
+
+## FailMode
+
+Behavior when the backing store is unreachable.
+
+```ts
+type FailMode = "open" | "closed";
+```
+
+- `"open"` — admit the request when the store is unavailable (fail permissively).
+- `"closed"` — deny the request when the store is unavailable (fail safely).
+
+## Clock
+
+Injected time source. Epoch-ms. Nothing in the core ever reads the clock directly.
+
+```ts
+import type { Clock } from "throttlekit";
+
+interface Clock {
+  now(): number; // current time in epoch-ms
+}
+```
+
+### ManualClock
+
+A controllable `Clock` for deterministic testing. Advance its time with `advance(ms)`.
+
+```ts
+import { ManualClock } from "throttlekit";
+
+const clock = new ManualClock(0);
+clock.advance(5_000); // advance 5 seconds
+console.log(clock.now()); // 5000
+```
+
+## Error Classes
+
+All errors extend `ThrottleKitError` and carry a `code` field. Prefer `code` over `instanceof` for
+robustness across realms and duplicate bundle copies.
+
+### ThrottleKitError
+
+Base class for all errors thrown by ThrottleKit.
+
+```ts
+import { ThrottleKitError } from "throttlekit";
+```
+
+<ResponseField name="code" type="ThrottleKitErrorCode">
+  Machine-readable discriminant. Robust to cross-realm `instanceof` checks. One of:
+  `"throttlekit_error"` | `"store_unavailable"` | `"not_implemented"` |
+  `"rate_limit_exceeded"` | `"queue_full"` | `"config_invalid"`.
+</ResponseField>
+
+### StoreUnavailableError
+
+Thrown when the backing store cannot be reached. Code: `"store_unavailable"`.
+
+```ts
+import { StoreUnavailableError } from "throttlekit";
+
+if (err.code === "store_unavailable") { /* fail open/closed */ }
+```
+
+### RateLimitExceededError
+
+Convenience error for callers who prefer throwing over inspecting a `Decision`. Carries the denying
+decision and its `retryAfterMs`. Code: `"rate_limit_exceeded"`.
+
+```ts
+import { RateLimitExceededError } from "throttlekit";
+
+const d = await limiter.check("user:42");
+if (!d.allowed) throw new RateLimitExceededError(d);
+// err.retryAfterMs, err.decision are available on the caught error
+```
+
+### NotImplementedError
+
+Thrown by placeholder code paths that are declared but not yet implemented. Code: `"not_implemented"`.
+
+## combineDecisions
+
+Combine two `Decision` objects into one — the pure algebra at the heart of `unifiedAdmission`.
+
+```ts
+import { combineDecisions } from "throttlekit";
+
+function combineDecisions(a: Decision, b: Decision): Decision
+```
+
+Field-by-field aggregation:
+
+| Field | Rule | Why |
+|---|---|---|
+| `allowed` | `a.allowed && b.allowed` | AND — both must allow |
+| `limit` | `min(a.limit, b.limit)` | binding (smaller) ceiling |
+| `remaining` | `min(a.remaining, b.remaining)` | binding remainder |
+| `resetAt` | `max(a.resetAt, b.resetAt)` | latest-resolution wait |
+| `retryAfterMs` | `max(a.retryAfterMs, b.retryAfterMs)` | dominant wait |
+
+The operation is total, pure, and satisfies four algebraic laws: identity (with `ALLOW_FULL`),
+associativity, commutativity, and idempotency.
+
+## ALLOW_FULL
+
+The neutral element (identity) for `combineDecisions`. An always-allowing `Decision` with
+`limit = remaining = Number.MAX_SAFE_INTEGER`.
+
+```ts
+import { ALLOW_FULL } from "throttlekit";
+
+combineDecisions(myDecision, ALLOW_FULL) // === myDecision
+```
+
+## buildRateLimitHeaders
+
+Build standards-compliant rate-limit response headers for a `Decision`.
+
+```ts
+import { buildRateLimitHeaders } from "throttlekit";
+
+function buildRateLimitHeaders(
+  decision: Decision,
+  opts?: BuildRateLimitHeadersOptions
+): Record<string, string>
+```
+
+<ParamField body="decision" type="Decision" required>
+  The decision to build headers from.
+</ParamField>
+
+<ParamField body="opts.now" type="number">
+  Current epoch-ms for delta-seconds math. Defaults to the system clock. Pass `clock.now()` for
+  deterministic output in tests.
+</ParamField>
+
+<ParamField body="opts.policyName" type="string">
+  Policy name surfaced in structured fields. Defaults to `"default"`.
+</ParamField>
+
+<ParamField body="opts.windowSeconds" type="number">
+  Window length in seconds, surfaced as `;w=` in `RateLimit-Policy`.
+</ParamField>
+
+<ParamField body="opts.emit" type="HeaderEmit">
+  Which header families to emit. Defaults to `{ draft: true }`.
+  <Expandable title="HeaderEmit fields">
+    <ParamField body="draft" type="boolean">
+      The IETF triple `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` (delta-seconds reset).
+    </ParamField>
+    <ParamField body="structured" type="boolean">
+      RFC 9651 structured `RateLimit` + `RateLimit-Policy` fields (draft-11).
+    </ParamField>
+    <ParamField body="legacy" type="boolean">
+      The legacy `X-RateLimit-*` triple (epoch-seconds reset).
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+```ts
+const headers = buildRateLimitHeaders(decision, {
+  emit: { draft: true, legacy: true },
+  policyName: "api",
+});
+// { "RateLimit-Limit": "100", "RateLimit-Remaining": "42", ... }
+```
+
+## createEnforcer
+
+Build a transport-agnostic `Enforcer` from a limiter plus the shared header/fail policy.
+
+```ts
+import { createEnforcer } from "throttlekit";
+
+function createEnforcer(options: EnforceOptions): Enforcer
+```
+
+<ParamField body="options.strategy" type="Strategy">
+  Build a fresh in-memory limiter from this strategy. Mutually exclusive with `limiter`.
+</ParamField>
+
+<ParamField body="options.limiter" type="Limiter">
+  A pre-built limiter to use directly. Mutually exclusive with `strategy`.
+</ParamField>
+
+<ParamField body="options.fail" type="FailMode">
+  Store-outage policy. Default `"open"`.
+</ParamField>
+
+<ParamField body="options.emit" type="HeaderEmit">
+  Which header families to emit on each decision.
+</ParamField>
+
+<ParamField body="options.policyName" type="string">
+  Policy name surfaced in structured headers.
+</ParamField>
+
+<ParamField body="options.onLimited" type="(key: string, decision: Decision) => void">
+  Callback fired on every denial (`outcome: "limited"`).
+</ParamField>
+
+<ParamField body="options.onError" type="(key: string, err: unknown) => void">
+  Callback fired when the store throws, before the fail policy is applied.
+</ParamField>
+
+<ResponseField name="limiter" type="Limiter">
+  The resolved limiter, for direct `check` use or header/policy introspection.
+</ResponseField>
+
+<ResponseField name="fail" type="FailMode">
+  The store-outage policy applied inside `enforce`.
+</ResponseField>
+
+<ResponseField name="enforce" type="(key: string, cost?: number) => Promise<EnforceResult>">
+  Run the limit for `key`. Never throws on a store outage — the `fail` policy converts it to an
+  `EnforceResult` with `outcome: "error"`.
+</ResponseField>
+
+```ts
+const { enforce } = createEnforcer({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  fail: "open",
+});
+
+const result = await enforce(clientIp({ remoteAddr: req.socket.remoteAddress }));
+if (!result.allowed) {
+  res.set(result.headers).status(result.outcome === "limited" ? 429 : 503).end();
+}
+```
+
+## clientIp
+
+Derive the proxy-correct, IPv6-aggregated client IP key from a request's socket peer and
+`X-Forwarded-For` header.
+
+```ts
+import { clientIp } from "throttlekit";
+
+function clientIp(input: ClientIpInput, config?: TrustProxyConfig): string
+```
+
+<ParamField body="input.remoteAddr" type="string" required>
+  The socket peer address (e.g. `req.socket.remoteAddress`).
+</ParamField>
+
+<ParamField body="input.xForwardedFor" type="string | string[]">
+  The `X-Forwarded-For` header value.
+</ParamField>
+
+<ParamField body="config.trustProxy" type="false | number | string[]">
+  Trust policy for `X-Forwarded-For`. Default `false` (ignore XFF, use socket peer only). A number
+  trusts that many hops; a string array is an IP/CIDR allowlist of trusted proxies.
+</ParamField>
+
+<ParamField body="config.ipv6Prefix" type="number">
+  IPv6 aggregation prefix length in bits. Default `64`. IPv4-mapped IPv6 is collapsed to its
+  embedded IPv4 address.
+</ParamField>
+
+```ts
+const key = clientIp(
+  { remoteAddr: req.socket.remoteAddress, xForwardedFor: req.headers["x-forwarded-for"] },
+  { trustProxy: 1, ipv6Prefix: 48 }
+);
+```
+
+## hashKey / hmacKeyer
+
+PII-safe HMAC-SHA-256 key hashing. Prevents raw identifiers (IPs, user IDs) from reaching the store.
+
+```ts
+import { hashKey, hmacKeyer } from "throttlekit";
+
+function hashKey(raw: string, secret: string): string
+function hmacKeyer(secret: string): (raw: string) => string
+```
+
+```ts
+const keyer = hmacKeyer(process.env.RATE_LIMIT_SECRET!);
+const key = keyer(userEmail); // 64-char lowercase hex digest
+const d = await limiter.check(key);
+```

@@ -1,0 +1,242 @@
+---
+title: "twoTier() — Distributed Limiter with L1/L2"
+sidebarTitle: "twoTier()"
+description: "Build a two-tier limiter that fronts a distributed store with a configurable local tier for reduced network cost and bounded global overshoot."
+---
+
+`twoTier` constructs a limiter that fronts a distributed (L2) store with an in-process (L1) local
+tier. The coordination mode controls the consistency/throughput trade-off: `strict` is exactly
+equivalent to a plain `rateLimit` over L2; `cached-deny` eliminates round trips for already-blocked
+keys; and `leased` drives steady-state network cost toward approximately one round trip per `batch`
+requests, with a proven bounded global overshoot.
+
+```ts
+import { twoTier, gcra } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+
+const limiter = twoTier({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000 }),
+  l2: new RedisStore({ client }),
+  mode: "leased",
+  lease: { batch: 50, windowCoupled: true },
+});
+
+const decision = await limiter.check("tenant:acme");
+```
+
+## Signature
+
+```ts
+function twoTier<S = unknown>(options: TwoTierOptions<S>): Limiter
+```
+
+## Options
+
+<ParamField body="strategy" type="Strategy<S>" required>
+  The algorithm enforced at L2 (and, in leased mode, the unit of the leased budget). Any built-in
+  strategy works; custom strategies work in `strict` and `cached-deny` modes.
+</ParamField>
+
+<ParamField body="l2" type="Store" required>
+  The distributed backing store. Typically a `RedisStore` or `PostgresStore`. The caller owns
+  this store — `close()` on the returned limiter does not close it.
+</ParamField>
+
+<ParamField body="mode" type="TwoTierMode" required>
+  Coordination mode. One of `"strict"`, `"cached-deny"`, or `"leased"`. See details below.
+</ParamField>
+
+<ParamField body="lease" type="LeaseOptions">
+  Required when `mode` is `"leased"`. Controls the batch size and window-coupling behavior.
+  <Expandable title="LeaseOptions fields">
+    <ParamField body="batch" type="number">
+      Tokens leased from L2 per refill. A larger batch means fewer round trips but a larger bounded
+      overshoot (`≤ L × batch` where `L` is the node count). Required unless `adaptive` is set.
+    </ParamField>
+    <ParamField body="lowWater" type="number">
+      When the local budget drops to or below this level, initiate a proactive (asynchronous) refill
+      so requests never block on the network. Default `0` (proactive refill disabled — lease on
+      demand only).
+    </ParamField>
+    <ParamField body="returnIdleAfterMs" type="number">
+      Drop a key's idle local credits after this many ms of inactivity. Capacity self-heals via L2
+      refill on the next request. Useful for limiting L1 memory on endpoints with long-tail keys.
+    </ParamField>
+    <ParamField body="windowCoupled" type="boolean">
+      When `true`, local credits expire at the L2 window boundary rather than carrying across into
+      the next window. This eliminates cross-window overshoot entirely — the global per-window bound
+      tightens to exactly `Limit` regardless of node count, at the cost of one re-lease per node
+      just after each window boundary. Default `false`.
+    </ParamField>
+    <ParamField body="adaptive" type="LeaseSizerOptions | (() => LeaseSizer)">
+      **Adaptive (online) lease sizing (GALE Pillar 2).** Instead of a fixed `batch`, size each
+      key's lease online using a `leaseSizer`. The learner descends onto the EOQ optimum
+      `√(2 · orderCost · demand / strandPenalty)` and tracks demand drift. Pass `LeaseSizerOptions`
+      to have the limiter build a per-key learner, or a `() => LeaseSizer` factory for a custom
+      learner. Safety is unchanged: the per-window global bound holds for any batch the learner
+      emits. `@experimental` — see STABILITY.md.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="l1" type="L1Options">
+  Local-tier tuning.
+  <Expandable title="L1Options fields">
+    <ParamField body="maxKeys" type="number">
+      Maximum distinct keys held in the L1 map before approximate CLOCK-style eviction. Unbounded
+      when omitted — set this on public-facing endpoints so a flood of unique keys cannot grow L1
+      memory without limit.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Injected time source. Defaults to the system clock.
+</ParamField>
+
+<ParamField body="prefix" type="string">
+  Key namespace prepended to every store key as `prefix:key`.
+</ParamField>
+
+## Coordination Modes
+
+### `"strict"`
+
+Every check consults L2 directly. Globally exact (one round trip per request). Under the hood this
+is equivalent to `rateLimit({ strategy, store: l2, clock, prefix })`.
+
+### `"cached-deny"`
+
+Allowed traffic flows through L2 unmodified. When L2 issues a denial, its `retryAfterMs` is cached
+locally and served directly for subsequent checks within that window, eliminating L2 load from
+repeated blocked requests. Globally exact for allowed traffic.
+
+### `"leased"`
+
+Each node leases a `batch`-sized budget from L2 and serves requests locally until the budget is
+exhausted. Steady-state network cost is approximately one round trip per `batch` requests. Concurrent
+misses on the same key are coalesced onto a single in-flight lease to prevent L2 stampedes.
+
+The global overshoot bound is `≤ L × batch` (where `L` is the live node count). With
+`windowCoupled: true` the bound tightens to exactly `Limit` independent of node count.
+
+## Return Value
+
+Returns a `Limiter` with the same interface as `rateLimit`. Note that `checkSync` and
+`checkManySync` are **not** available on a `twoTier` limiter in `cached-deny` or `leased` mode
+(L2 access is inherently asynchronous) — they throw a `ThrottleKitError` if called.
+
+## Helper Functions
+
+### `eoqOptimum(demand, orderCost, strandPenalty)`
+
+```ts
+function eoqOptimum(demand: number, orderCost: number, strandPenalty: number): number
+```
+
+The closed-form Economic Order Quantity optimum: `√(2 · orderCost · demand / strandPenalty)`. The
+target the adaptive lease sizer descends toward. Pure math, no state.
+
+### `leaseSizer(options)`
+
+```ts
+function leaseSizer(options: LeaseSizerOptions): LeaseSizer
+```
+
+Build a per-key online lease sizer. At each window boundary, feed it the demand that key served
+(`observe(demand)`) and read back the batch for the next window (`size()`). `@experimental`.
+
+### `predictiveLeaseSizer(options)`
+
+```ts
+function predictiveLeaseSizer(options: PredictiveLeaseSizerOptions): PredictiveLeaseSizer
+```
+
+A prediction-augmented lease sizer that blends a per-window demand forecast with the robust
+`leaseSizer` via a Hedge meta-learner. `@experimental`.
+
+### `regionFairPool(options)`
+
+```ts
+function regionFairPool(options: RegionFairPoolOptions): RegionFairPool
+```
+
+An in-process, synchronous weighted-fair pool over regions (a WFE over region identities). Used as
+the cross-region layer in `federatedWeightedFairEscrow`. `@experimental`.
+
+### `weightedFairEscrow(options)`
+
+```ts
+function weightedFairEscrow(options: WeightedFairEscrowOptions): WeightedFairEscrowLimiter
+```
+
+A two-tier limiter where L2 leases are distributed across tenants using weighted max-min fairness
+(GALE Pillar 4). No tenant can be starved below its weighted floor by a flood from others.
+`@experimental`.
+
+### `federatedWeightedFairEscrow(options)`
+
+```ts
+function federatedWeightedFairEscrow(
+  options: FederatedWeightedFairEscrowOptions
+): FederatedWeightedFairEscrowLimiter
+```
+
+Lifts `weightedFairEscrow` across regions: per-region tenant WFE composed with a shared
+cross-region `regionFairPool` into a global weighted-max-min guarantee. `@experimental`.
+
+## Examples
+
+### Leased mode with window coupling
+
+```ts
+import { twoTier, gcra } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+
+const store = new RedisStore({ client });
+
+const limiter = twoTier({
+  strategy: gcra({ limit: 10_000, periodMs: 60_000 }),
+  l2: store,
+  mode: "leased",
+  lease: {
+    batch: 100,
+    windowCoupled: true,  // eliminates cross-window overshoot
+    lowWater: 10,         // proactive refill at 10 remaining
+    returnIdleAfterMs: 30_000,
+  },
+  l1: { maxKeys: 50_000 },
+});
+```
+
+### Cached-deny to absorb abusive clients
+
+```ts
+import { twoTier, fixedWindow } from "throttlekit";
+
+const limiter = twoTier({
+  strategy: fixedWindow({ limit: 100, windowMs: 60_000 }),
+  l2: redisStore,
+  mode: "cached-deny",
+  // A blocked client stops hitting Redis for the duration of its retryAfterMs
+});
+```
+
+### Adaptive lease sizing (GALE Pillar 2)
+
+```ts
+import { twoTier, gcra } from "throttlekit";
+
+const limiter = twoTier({
+  strategy: gcra({ limit: 5_000, periodMs: 60_000 }),
+  l2: redisStore,
+  mode: "leased",
+  lease: {
+    adaptive: {
+      orderCost: 1,       // cost of one L2 round trip
+      strandPenalty: 0.5, // cost of stranded (unexpired) credits
+    },
+    windowCoupled: true,
+  },
+});
+```

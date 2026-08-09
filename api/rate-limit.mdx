@@ -1,0 +1,214 @@
+---
+title: "rateLimit() — Core Limiter Factory"
+sidebarTitle: "rateLimit()"
+description: "Build a rate limiter from a strategy and a store. The single entry point for constructing a Limiter from any built-in or custom algorithm."
+---
+
+`rateLimit` is the primary factory in ThrottleKit. It wires a pure algorithm (a `Strategy`) to a backing store and returns a `Limiter` — the standard interface every adapter, decorator, and framework integration expects. On an in-memory store the hot path runs fully synchronous and allocation-free; on Redis the same configuration collapses to a single atomic `EVALSHA` round trip.
+
+```ts
+import { rateLimit, gcra, RedisStore } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  store: new RedisStore({ client }),
+  prefix: "api",
+});
+
+const decision = await limiter.check("user:42");
+if (!decision.allowed) {
+  return res.status(429).json({ retryAfterMs: decision.retryAfterMs });
+}
+```
+
+## Signature
+
+```ts
+function rateLimit<S = unknown>(options: RateLimitOptions<S>): Limiter
+```
+
+## Options
+
+<ParamField body="strategy" type="Strategy<S>" required>
+  The pure rate-limiting algorithm to enforce. All built-in algorithms (`gcra`, `tokenBucket`,
+  `fixedWindow`, `slidingWindow`, `slidingWindowLog`, `quota`, `leakyBucket`) are strategies.
+  Custom strategies must implement the `Strategy<S>` interface.
+</ParamField>
+
+<ParamField body="store" type="Store">
+  Where the algorithm's per-key state lives. Defaults to a fresh in-process `MemoryStore` when
+  omitted. Pass a `RedisStore` or `PostgresStore` for distributed enforcement. When you supply a
+  store, its lifecycle is yours — `close()` on the returned limiter will not close it.
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Injected time source used for all timestamp operations. Defaults to the system clock. Inject a
+  `ManualClock` to drive time deterministically in tests.
+</ParamField>
+
+<ParamField body="prefix" type="string">
+  Key namespace prepended to every store key as `prefix:key`. Use this when multiple independent
+  limiters share one store so their keyspaces never collide.
+</ParamField>
+
+## Return Value
+
+`rateLimit` returns a `Limiter`. All methods are safe to call concurrently.
+
+<ResponseField name="strategy" type="Strategy">
+  The active strategy, for headers/policy introspection. Use `limiter.strategy.name` to get the
+  stable algorithm identifier (e.g. `"gcra"`, `"tokenBucket"`).
+</ResponseField>
+
+<ResponseField name="check" type="(key: string, cost?: number) => Promise<Decision>">
+  Check `key` consuming `cost` units (default `1`). The returned promise resolves to a `Decision`
+  regardless of whether the request is admitted. Never rejects on a store outage when a `fail` mode
+  is configured via `createEnforcer`.
+</ResponseField>
+
+<ResponseField name="checkSync" type="(key: string, cost?: number) => Decision">
+  Zero-`await` synchronous check. Only available when the configured store provides `applySync`
+  (e.g. `MemoryStore`). Throws a `ThrottleKitError` if the store is async-only.
+
+  ```ts
+  const decision = limiter.checkSync("user:42"); // no await, no Promise
+  ```
+</ResponseField>
+
+<ResponseField name="checkMany" type="(keys: readonly string[], cost?: number) => Promise<Decision[]>">
+  Check many independent keys in one call, each at the same cost. All keys are evaluated at a
+  **single consistent timestamp**. On a Redis-backed store with auto-pipelining enabled the entire
+  batch collapses to one round trip. Returns decisions in input order.
+</ResponseField>
+
+<ResponseField name="checkManySync" type="(keys: readonly string[], cost?: number) => Decision[]">
+  Synchronous batch check. Same semantics as `checkMany` but runs without promises. Requires a
+  synchronous store; throws otherwise.
+</ResponseField>
+
+<ResponseField name="peek" type="(key: string) => Promise<Decision> | undefined">
+  Non-consuming introspection: returns the current `Decision` for `key` **without spending** any
+  capacity. Useful for building retry/backoff UX. Only present when the strategy implements `peek`.
+  Absent on composite limiters where a non-consuming read isn't well-defined.
+</ResponseField>
+
+<ResponseField name="peekSync" type="(key: string) => Decision | undefined">
+  Synchronous form of `peek`. Requires both a synchronous store and a strategy that implements `peek`.
+</ResponseField>
+
+<ResponseField name="forecast" type="(key: string, cost?: number) => Promise<Forecast> | undefined">
+  Non-consuming capacity forecast: how many `cost`-sized requests are spendable right now
+  (`spendableNow`), when capacity next increases (`nextReplenishAt`), and when it is fully
+  replenished (`fullAt`). Optional — present only when the strategy implements `forecast`.
+</ResponseField>
+
+<ResponseField name="forecastSync" type="(key: string, cost?: number) => Forecast | undefined">
+  Synchronous form of `forecast`. Requires a synchronous store and a strategy with `forecast`.
+</ResponseField>
+
+<ResponseField name="reset" type="(key: string) => Promise<void>">
+  Forget a key's stored state. The next check for that key starts fresh.
+</ResponseField>
+
+<ResponseField name="close" type="() => Promise<void> | undefined">
+  Release resources owned by this limiter instance. When `rateLimit` created its own default store
+  (`store` was omitted), `close()` shuts it down. When you passed a store, `close()` is a no-op for
+  that store — closing it remains your responsibility.
+</ResponseField>
+
+## The Decision Object
+
+Every check method returns (or resolves to) a `Decision`:
+
+<ResponseField name="allowed" type="boolean">
+  `true` when the request is admitted, `false` when it is rate-limited.
+</ResponseField>
+
+<ResponseField name="limit" type="number">
+  The effective ceiling: burst capacity for GCRA/token bucket, window quota for fixed/sliding window.
+</ResponseField>
+
+<ResponseField name="remaining" type="number">
+  Whole units remaining before the next rejection. Never negative.
+</ResponseField>
+
+<ResponseField name="resetAt" type="number">
+  Epoch-ms at which the limiter will be fully replenished.
+</ResponseField>
+
+<ResponseField name="retryAfterMs" type="number">
+  Milliseconds the caller should wait before retrying. `0` when `allowed` is `true`.
+</ResponseField>
+
+## Error Handling
+
+`rateLimit` itself does not throw on store outages — that responsibility belongs to the caller or to
+`createEnforcer` (which applies a `FailMode`). Two error classes are relevant:
+
+**`StoreUnavailableError`** — thrown when the backing store is unreachable and you call `check`
+directly (without `createEnforcer`). Its `code` is `"store_unavailable"`.
+
+```ts
+import { StoreUnavailableError } from "throttlekit";
+
+try {
+  const d = await limiter.check("user:42");
+} catch (err) {
+  if (err instanceof StoreUnavailableError) {
+    // store is down — apply your own fail-open / fail-closed logic
+  }
+}
+```
+
+**`RateLimitExceededError`** — a convenience error for callers who prefer throwing over inspecting a
+`Decision`. Not thrown by `rateLimit` itself; use `createEnforcer` or throw it manually.
+
+```ts
+import { RateLimitExceededError } from "throttlekit";
+
+const d = await limiter.check("user:42");
+if (!d.allowed) throw new RateLimitExceededError(d);
+// d.retryAfterMs is accessible on the error too
+```
+
+## Examples
+
+### In-memory limiter (default store)
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+
+const limiter = rateLimit({ strategy: gcra({ limit: 10, periodMs: 1_000 }) });
+
+for (const key of ["alice", "bob", "alice"]) {
+  const d = await limiter.check(key);
+  console.log(key, d.allowed, d.remaining);
+}
+```
+
+### Redis-backed limiter with prefix
+
+```ts
+import { rateLimit, gcra, RedisStore, fromIoredis } from "throttlekit/redis";
+import IORedis from "ioredis";
+
+const redis = new IORedis();
+const store = new RedisStore({ client: fromIoredis(redis) });
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000 }),
+  store,
+  prefix: "api:v2",
+});
+```
+
+### Synchronous check on MemoryStore
+
+```ts
+import { rateLimit, fixedWindow } from "throttlekit";
+
+const limiter = rateLimit({ strategy: fixedWindow({ limit: 5, windowMs: 10_000 }) });
+
+// No await required — MemoryStore supports applySync
+const d = limiter.checkSync("tenant-a");
+```

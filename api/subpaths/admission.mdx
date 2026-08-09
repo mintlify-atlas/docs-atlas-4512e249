@@ -1,0 +1,490 @@
+---
+title: "Admission & Fairness APIs"
+sidebarTitle: "Admission"
+description: "Multi-axis admission, adaptive throttling, weighted fairness, token budgets, learned reservations, decision tap callbacks, and sketch-based rate limiting."
+---
+
+ThrottleKit's admission module provides higher-order building blocks for controlling *whether* work
+should be attempted at all, upstream of per-key rate limits. These APIs compose with the core
+`Limiter` interface via `combineDecisions` and cover adaptive client-side throttling, weighted
+max-min fairness, streaming token budgets, online learned reservations, analytics decoration,
+approximate sketch-based limiting, and multi-dimensional enforcement.
+
+All of these are exported from the top-level `throttlekit` package.
+
+## unifiedAdmission
+
+Compose three orthogonal admission axes — rate, concurrency, and cost — into one `UnifiedAdmitter`
+via the `combineDecisions` algebra. Evaluation order is concurrency → rate → cost, first denial
+short-circuits.
+
+```ts
+import { unifiedAdmission } from "throttlekit";
+
+function unifiedAdmission(options: UnifiedAdmissionOptions): UnifiedAdmitter
+```
+
+<ParamField body="rate" type="Limiter">
+  The rate axis — a `Limiter` returning a `Decision` for `(key, 1)` per admit call.
+</ParamField>
+
+<ParamField body="concurrency" type="ConcurrencyGuard">
+  The concurrency axis — a `ConcurrencyGuard` from `adaptiveConcurrency()`. State is local
+  (in-process); no store round trip.
+</ParamField>
+
+<ParamField body="cost" type="Limiter">
+  The cost axis — a `Limiter` returning a `Decision` for `(key, cost)` where `cost` is the
+  per-request weight.
+</ParamField>
+
+<ParamField body="backend" type='"sequential" | "lua-fused"'>
+  `"sequential"` (default) runs axes in order; first deny short-circuits. `"lua-fused"` collapses
+  rate + cost into one Redis `EVALSHA` — requires the `fused` option group.
+</ParamField>
+
+<ParamField body="policy" type='"marginal" | "joint-lp"'>
+  `"marginal"` (default) admits when every axis independently allows. `"joint-lp"` additionally
+  applies a bid-price filter (`value ≥ p_R + p_C · cost`). `@experimental`.
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Injectable time source. Defaults to the system clock.
+</ParamField>
+
+```ts
+const admitter = unifiedAdmission({
+  rate: rateLimit({ strategy: gcra({ limit: 1000, periodMs: 60_000 }), store: redisStore }),
+  cost: rateLimit({ strategy: tokenBucket({ limit: 100_000, ratePerSec: 1_000 }), store: redisStore }),
+  concurrency: adaptiveConcurrency({ initialLimit: 20 }).guard,
+});
+
+const { decision, release } = await admitter.admit({ key: "user:42", cost: 50 });
+try {
+  if (!decision.allowed) return tooManyRequests(decision);
+  const result = await doWork();
+  return result;
+} finally {
+  release();
+}
+```
+
+### UnifiedAdmitter Methods
+
+<ResponseField name="admit" type="(opts?: UnifiedAdmitOptions) => Promise<UnifiedAdmission>">
+  Async admit. Works for any backend mix.
+  <Expandable title="UnifiedAdmitOptions">
+    <ParamField body="key" type="string">
+      Key passed to rate/cost axes. Default `""` (the global bucket).
+    </ParamField>
+    <ParamField body="cost" type="number">
+      Cost weight passed to the cost axis. Default `1`.
+    </ParamField>
+    <ParamField body="value" type="number">
+      Per-request value for the joint-LP bid-price test. Ignored unless `policy: "joint-lp"`. Default `1`.
+    </ParamField>
+    <ParamField body="hold" type="number">
+      Expected service time for the 3-axis joint-LP concurrency term. Default `0`.
+    </ParamField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="admitSync" type="(opts?: UnifiedAdmitOptions) => UnifiedAdmission">
+  Synchronous admit. Throws when any configured axis lacks a synchronous code path. Not available
+  with `backend: "lua-fused"`.
+</ResponseField>
+
+<ResponseField name="lastDecisions" type="() => Readonly<Partial<Record<UnifiedAxis, Decision | undefined>>>">
+  Snapshot of the most recent admit's per-axis decisions. Each call returns a fresh frozen object
+  safe to leak into telemetry. Short-circuited axes are `undefined`.
+</ResponseField>
+
+### UnifiedAdmission Fields
+
+<ResponseField name="decision" type="Decision">
+  The combined Decision across all configured axes.
+</ResponseField>
+
+<ResponseField name="release" type="(opts?: { dropped?: boolean }) => void">
+  Release the held concurrency slot when work finishes. Pass `dropped: true` to signal overload.
+  Idempotent; a no-op on denied admissions.
+</ResponseField>
+
+<ResponseField name="bindingAxis" type="UnifiedAxis | undefined">
+  The axis whose denial bound this admission (`"rate"` / `"concurrency"` / `"cost"`), or
+  `undefined` when admitted or when the joint-LP policy filter denied.
+</ResponseField>
+
+---
+
+## tokenBudget
+
+Windowed token-budget meter for **post-hoc** costs (e.g. LLM output tokens billed as they stream).
+
+```ts
+import { tokenBudget } from "throttlekit";
+
+function tokenBudget(options: TokenBudgetOptions): TokenBudgetMeter
+```
+
+<ParamField body="budget" type="number" required>
+  Token budget `L` enforced per window. Floored to an integer; must be `≥ 1`.
+</ParamField>
+
+<ParamField body="windowMs" type="number" required>
+  Window width in ms. Windows are epoch-aligned.
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Injected clock. Defaults to the system clock.
+</ParamField>
+
+```ts
+const meter = tokenBudget({ budget: 100_000, windowMs: 60_000 });
+
+for await (const tok of completion) {
+  if (!meter.debitSync(1).allowed) break; // budget spent — stop generating
+  emit(tok);
+}
+```
+
+<ResponseField name="debitSync" type="(tokens?: number) => Decision">
+  Atomically debit `tokens` (default `1`) against the current window. Stop-at-boundary: a debit is
+  admitted iff budget remains *before* it (`served < L`).
+</ResponseField>
+
+<ResponseField name="debit" type="(tokens?: number) => Promise<Decision>">
+  Promise-returning form of `debitSync`. Resolves synchronously.
+</ResponseField>
+
+<ResponseField name="remaining" type="() => number">
+  Tokens remaining in the current window (`≥ 0`). Rolls the window but does not debit.
+</ResponseField>
+
+<ResponseField name="reset" type="() => void">
+  Forget all usage; the next call starts a fresh window.
+</ResponseField>
+
+---
+
+## distributedTokenBudget
+
+The fleet-shared, `Store`-backed sibling of `tokenBudget`. The same stop-at-boundary rule run as an
+atomic read-modify-write against a shared counter, so one budget `L` is enforced across every
+gateway with per-token overshoot of 0 independent of fleet size.
+
+```ts
+import { distributedTokenBudget } from "throttlekit";
+
+function distributedTokenBudget(options: DistributedTokenBudgetOptions): DistributedTokenBudgetMeter
+```
+
+---
+
+## adaptiveThrottle
+
+Google SRE client-side adaptive throttling. Sheds requests locally before they leave the client
+when the backend's accept rate drops.
+
+```ts
+import { adaptiveThrottle } from "throttlekit";
+
+function adaptiveThrottle(options?: AdaptiveThrottleOptions): AdaptiveThrottle
+```
+
+<ParamField body="k" type="number">
+  Acceptance multiplier `K` from the SRE formula. Default `2`. Higher values tolerate more backend
+  rejection before shedding locally. Must be `≥ 1`.
+</ParamField>
+
+<ParamField body="windowMs" type="number">
+  Rolling accounting window width in ms. Default `10_000`.
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Injected clock. Defaults to the system clock.
+</ParamField>
+
+<ParamField body="random" type="() => number">
+  Source of randomness for the probabilistic shed. Inject a seeded PRNG for deterministic tests.
+  Default `Math.random`.
+</ParamField>
+
+```ts
+const throttle = adaptiveThrottle({ k: 2 });
+
+async function callBackend() {
+  const shouldSend = throttle.request(); // probabilistically shed when backend is overloaded
+  if (!shouldSend) throw new Error("shed locally");
+  try {
+    const result = await backend.call();
+    throttle.record(true);
+    return result;
+  } catch {
+    throttle.record(false);
+    throw;
+  }
+}
+```
+
+<ResponseField name="request" type="(priority?: number) => boolean">
+  Decide whether to send the next request. Returns `true` to send, `false` to shed.
+  `priority` in `[0, 1]` scales the shed probability by `(1 - priority)`.
+</ResponseField>
+
+<ResponseField name="record" type="(accepted: boolean) => void">
+  Feed back the backend's outcome. Call only for **sent** requests (not shed ones).
+</ResponseField>
+
+<ResponseField name="rejectProbability" type="() => number">
+  The current local reject probability `p` in `[0, 1]`. Read-only.
+</ResponseField>
+
+---
+
+## weightedFairShare
+
+Weighted equal-share fairness across tenants. One global budget per epoch-aligned window, split
+proportionally to per-tenant weights.
+
+```ts
+import { weightedFairShare } from "throttlekit";
+
+function weightedFairShare(options: WeightedFairShareOptions): WeightedFairShareLimiter
+```
+
+<ParamField body="limit" type="number" required>
+  Global admissions budget shared across all tenants per window.
+</ParamField>
+
+<ParamField body="windowMs" type="number" required>
+  Window width in ms. Windows are epoch-aligned.
+</ParamField>
+
+<ParamField body="weightOf" type="(tenant: string) => number">
+  Per-tenant weight. Default `() => 1` (equal — equivalent to `fairShare`).
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Injected clock. Defaults to the system clock.
+</ParamField>
+
+---
+
+## weightedMaxMin
+
+Weighted max-min fair allocation of an integer `limit` across tenants with known demands. Work-
+conserving and weight-honoring. Returns integer credits per tenant.
+
+```ts
+import { weightedMaxMin } from "throttlekit";
+
+function weightedMaxMin(
+  demands: readonly number[],
+  weights: readonly number[],
+  limit: number
+): number[]
+```
+
+Use this for batch allocation (when you have all demands at once) as opposed to the streaming
+`weightedFairShare`.
+
+---
+
+## learnedReservation
+
+Online newsvendor learner for per-request token reservations. Descends onto the cost-optimal
+`criticalFractile` quantile with `O(√T)` regret. `@experimental`.
+
+```ts
+import { learnedReservation } from "throttlekit";
+
+function learnedReservation(options: LearnedReservationOptions): LearnedReservation
+```
+
+<ParamField body="holdCost" type="number" required>
+  Penalty per token reserved but unused. Must be `> 0`.
+</ParamField>
+
+<ParamField body="overrunCost" type="number" required>
+  Penalty per token of realised cost beyond the reservation. Must be `> 0`.
+</ParamField>
+
+<ParamField body="maxReservation" type="number" required>
+  Upper clamp on the reservation (the per-request cap `m`). Must be `> 0`.
+</ParamField>
+
+<ParamField body="minReservation" type="number">
+  Lower clamp on the reservation. Default `0`.
+</ParamField>
+
+```ts
+const meter = tokenBudget({ budget: 100_000, windowMs: 60_000 });
+const policy = learnedReservation({ holdCost: 1, overrunCost: 4, maxReservation: 4096 });
+
+if (policy.reserve() <= meter.remaining()) {
+  let produced = 0;
+  for await (const tok of completion) {
+    if (!meter.debitSync(1).allowed) break;
+    emit(tok);
+    produced++;
+  }
+  policy.observe(produced); // learn from realised cost
+}
+```
+
+---
+
+## predictiveReservation
+
+Learning-augmented reservation. Blends a per-request output-length prediction with the robust
+`learnedReservation` via a Hedge meta-learner: accurate predictions drive cost toward the
+clairvoyant optimum; adversarial ones fall back to the no-regret quantile. `@experimental`.
+
+```ts
+import { predictiveReservation } from "throttlekit";
+
+function predictiveReservation(options: PredictiveReservationOptions): PredictiveReservation
+```
+
+---
+
+## withAnalytics
+
+Wrap a `Limiter` to track its traffic in-process with Space-Saving top-K heavy hitter detection.
+Zero config, no OpenTelemetry required. `@experimental`.
+
+```ts
+import { withAnalytics } from "throttlekit";
+
+function withAnalytics(limiter: Limiter, options?: AnalyticsOptions): AnalyticsLimiter
+```
+
+<ParamField body="topK" type="number">
+  How many heavy hitters each summary tracks. Default `10`.
+</ParamField>
+
+<ParamField body="windowMs" type="number">
+  Fixed, epoch-aligned window width in ms. Default `60_000`.
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Injected clock.
+</ParamField>
+
+```ts
+const tracked = withAnalytics(limiter, { topK: 20, windowMs: 60_000 });
+const snap = tracked.analytics();
+console.log(snap.denyRate, snap.topDenied);
+```
+
+---
+
+## tapDecisions
+
+Wrap a `Limiter` so a callback fires once per completed check. The tap never breaks the limiter —
+exceptions inside it are caught and dropped.
+
+```ts
+import { tapDecisions } from "throttlekit";
+
+function tapDecisions(limiter: Limiter, onDecision: DecisionTap): Limiter
+```
+
+```ts
+const limiter = tapDecisions(
+  rateLimit({ strategy: gcra({ limit: 100, periodMs: 60_000 }) }),
+  (event) => {
+    metrics.histogram("check_duration_ms", event.durationMs);
+    if (!event.decision.allowed) logger.warn({ key: event.key }, "rate limited");
+  }
+);
+```
+
+---
+
+## sketchRateLimit
+
+Approximate, **fixed-memory** rate limiter over an unbounded key universe backed by a Count-Min
+Sketch. Memory is `O(1/epsilon · ln(1/delta))` — independent of key count. Never over-admits
+(hard, non-probabilistic guarantee). `@experimental`.
+
+```ts
+import { sketchRateLimit } from "throttlekit";
+
+function sketchRateLimit(options: SketchRateLimitOptions): SketchRateLimiter
+```
+
+<ParamField body="limit" type="number" required>
+  Maximum requests admitted per key within each window.
+</ParamField>
+
+<ParamField body="windowMs" type="number" required>
+  Window width in ms. Epoch-aligned.
+</ParamField>
+
+<ParamField body="epsilon" type="number">
+  Additive accuracy: overestimates a key's count by at most `epsilon * N`. Default `0.01`.
+</ParamField>
+
+<ParamField body="delta" type="number">
+  Failure probability for the epsilon bound. Default `0.001`.
+</ParamField>
+
+<ParamField body="conservative" type="boolean">
+  Use the Estan–Varghese conservative-update rule for tighter estimates. Default `true`.
+</ParamField>
+
+<ParamField body="seed" type="number">
+  32-bit hash seed. Defaults to a per-instance random value (recommended). Pass a fixed value only
+  for reproducible tests.
+</ParamField>
+
+```ts
+// Protect against a DDoS flood of millions of unique IPs in fixed memory
+const sketch = sketchRateLimit({ limit: 100, windowMs: 60_000, epsilon: 0.01 });
+const d = sketch.checkSync(clientIpKey);
+```
+
+---
+
+## multiRateLimit / all / any
+
+Multi-dimensional limiter: evaluate per-IP ∧ per-user ∧ per-route (etc.) atomically. On a
+synchronous store reads all dimensions, decides, then commits all-or-none. On Redis fuses every
+dimension into a single Lua round trip.
+
+```ts
+import { multiRateLimit, all, any } from "throttlekit";
+
+function all<Ctx>(dimensions: Dimensions<Ctx>): MultiStrategy<Ctx>
+function any<Ctx>(dimensions: Dimensions<Ctx>): MultiStrategy<Ctx>
+function multiRateLimit<Ctx>(options: MultiRateLimitOptions<Ctx>): MultiLimiter<Ctx>
+```
+
+- `all(dimensions)` — allow only if **every** dimension allows. Consume nothing unless all allow
+  (no partial consume).
+- `any(dimensions)` — allow if **any** dimension allows. Consume only the dimensions that
+  individually allow.
+
+```ts
+import { multiRateLimit, all, gcra, tokenBucket } from "throttlekit";
+
+type Ctx = { ip: string; userId: string };
+
+const limiter = multiRateLimit({
+  strategy: all({
+    byIp: {
+      key: (ctx) => ctx.ip,
+      strategy: gcra({ limit: 100, periodMs: 60_000 }),
+    },
+    byUser: {
+      key: (ctx) => ctx.userId,
+      strategy: gcra({ limit: 30, periodMs: 60_000 }),
+    },
+  }),
+  store: redisStore,
+});
+
+const d = await limiter.check({ ip: "1.2.3.4", userId: "user:42" });
+```

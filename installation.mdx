@@ -1,0 +1,135 @@
+---
+title: "Installing ThrottleKit"
+sidebarTitle: "Installation"
+description: "Install ThrottleKit via npm, yarn, pnpm, or bun. Covers Node.js requirements, optional peer dependencies, ESM/CJS support, and all 24 subpath entry points."
+---
+
+ThrottleKit is published to npm as a single package with **zero runtime dependencies**. Peer dependencies are optional — install only what your chosen stores and adapters actually use.
+
+## Package manager
+
+<CodeGroup>
+
+```bash npm
+npm install throttlekit
+```
+
+```bash yarn
+yarn add throttlekit
+```
+
+```bash pnpm
+pnpm add throttlekit
+```
+
+```bash bun
+bun add throttlekit
+```
+
+</CodeGroup>
+
+## Node.js requirement
+
+ThrottleKit requires **Node.js ≥ 18**. The Web `fetch` adapter additionally runs on Cloudflare Workers, Deno, and Bun with no changes.
+
+<Note>
+  All CI is run against Node 20, 22, and 24. Node 18 is the minimum supported version because it ships the Web `fetch` API natively.
+</Note>
+
+## Zero runtime dependencies
+
+The core package and all framework adapters ship with **zero runtime dependencies**. No transitive packages are installed unless you opt in to a peer dep for a specific store or adapter.
+
+<Tip>
+  This means `npm install throttlekit` adds exactly one entry to your `node_modules` — ideal for edge runtimes and Lambda functions where cold-start size matters.
+</Tip>
+
+## Optional peer dependencies
+
+Install peer dependencies only for the backends and frameworks you use. Everything else remains optional.
+
+| Peer dependency | When you need it | Subpath |
+|---|---|---|
+| `ioredis` | Redis store with `ioredis` client | `throttlekit/redis` |
+| `node-redis` | Redis store with `node-redis` client | `throttlekit/redis` |
+| `pg` | Postgres store | `throttlekit/postgres` |
+| `express` | Express middleware adapter | `throttlekit/express` |
+| `fastify` | Fastify plugin adapter | `throttlekit/fastify` |
+| `@hono/hono` | Hono middleware adapter | `throttlekit/hono` |
+| `koa` | Koa middleware adapter | `throttlekit/koa` |
+| `next` | Next.js API route adapter | `throttlekit/next` |
+| `@nestjs/common` | NestJS guard adapter | `throttlekit/nest` |
+| `@sveltejs/kit` | SvelteKit hook adapter | `throttlekit/sveltekit` |
+| `@remix-run/node` | Remix loader/action adapter | `throttlekit/remix` |
+| `elysia` | Elysia plugin adapter | `throttlekit/elysia` |
+| `@aws-sdk/client-dynamodb` | DynamoDB store | `throttlekit/dynamodb` |
+
+Installing a peer dependency for a store you do not use has no effect on the core package.
+
+## ESM and CJS support
+
+ThrottleKit ships **both ESM and CommonJS** builds with full TypeScript declarations (`.d.ts` and `.d.cts`) for every entry point. Tree-shaking works out of the box with any modern bundler.
+
+```ts
+// ESM (recommended)
+import { rateLimit, gcra } from "throttlekit";
+
+// CommonJS
+const { rateLimit, gcra } = require("throttlekit");
+```
+
+The ESM/CJS resolution matrix across all 24 subpaths is mechanically verified by `attw` and `publint` on every push.
+
+## Subpath entry points
+
+ThrottleKit exports **24 subpath entry points**, each tree-shakeable and independently typed. Import only what you use.
+
+| Entry point | Contents |
+|---|---|
+| `throttlekit` | Core: `rateLimit`, all strategies, `MemoryStore`, `ManualClock`, types |
+| `throttlekit/redis` | `RedisStore` (ioredis, node-redis, Upstash REST) |
+| `throttlekit/postgres` | `PostgresStore` |
+| `throttlekit/dynamodb` | `DynamoDBStore` |
+| `throttlekit/deno` | `DenoKvStore` |
+| `throttlekit/cloudflare` | `DurableObjectStore`, `D1Store`, `KVStore` |
+| `throttlekit/express` | `expressRateLimit` middleware |
+| `throttlekit/fastify` | `fastifyRateLimit` plugin |
+| `throttlekit/koa` | `koaRateLimit` middleware |
+| `throttlekit/hono` | `honoRateLimit` middleware |
+| `throttlekit/next` | `nextRateLimit` for API routes and App Router |
+| `throttlekit/nest` | `ThrottleGuard` for NestJS |
+| `throttlekit/sveltekit` | `sveltekitRateLimit` hook |
+| `throttlekit/remix` | `remixRateLimit` for loaders and actions |
+| `throttlekit/elysia` | `elysiaRateLimit` plugin |
+| `throttlekit/fetch` | `withRateLimit` for Web `fetch` (Cloudflare, Deno, Bun, Next edge) |
+| `throttlekit/lambda` | `lambdaRateLimit` for AWS Lambda |
+| `throttlekit/trpc` | `trpcRateLimit` middleware |
+| `throttlekit/grpc` | `grpcRateLimit` interceptor |
+| `throttlekit/twotier` | `twoTier`, `LeaseSpender`, `weightedFairEscrow`, `leaseSizer` |
+| `throttlekit/federation` | `federate`, `GlobalCoordinator`, `RedisCoordinator` |
+| `throttlekit/otel` | OpenTelemetry metrics integration |
+| `throttlekit/policy` | `plan`, `policySet`, `assertPlanAcceptable` (experimental) |
+| `throttlekit/testkit` | `recordLimiter`, `replay`, `ManualClock` test utilities |
+
+<Warning>
+  The `throttlekit/policy` and `throttlekit/testkit` subpaths are **experimental** and may change shape in a minor release. Pin an exact version if you depend on them in CI.
+</Warning>
+
+## Verifying your install
+
+After installation, verify the package resolves correctly:
+
+```ts
+import { version } from "throttlekit";
+console.log(version); // e.g. "1.0.0"
+```
+
+Or run the in-memory quickstart to confirm everything is working:
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+
+const limiter = rateLimit({ strategy: gcra({ limit: 5, periodMs: 1_000 }) });
+const d = limiter.checkSync("test");
+console.log(d.allowed, d.remaining); // true, 4
+```

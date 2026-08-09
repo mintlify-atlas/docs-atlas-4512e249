@@ -1,0 +1,196 @@
+---
+title: "Redis Store"
+sidebarTitle: "Redis"
+description: "Distributed, exact rate limiting over Redis — single atomic EVALSHA per check, with support for ioredis, node-redis, and Upstash REST."
+---
+
+`RedisStore` is ThrottleKit's flagship distributed backend. Every built-in algorithm ships a Lua script that runs as a single server-side `EVALSHA` call — one network round trip, atomically executed under Redis's command model, with no `WATCH`/`MULTI` retry loop on the hot path. Custom strategies without a Lua form fall back automatically to optimistic concurrency (`WATCH`/`GET`/`MULTI`/`EXEC`) with bounded retries, so any pure user-authored strategy works correctly across a fleet without writing Lua.
+
+## Installation
+
+`RedisStore` is exported from the `throttlekit/redis` subpath. You also need a Redis client as a peer dependency — install whichever client you prefer:
+
+```bash
+# ioredis (recommended for full feature support)
+npm install throttlekit ioredis
+
+# node-redis (the official @redis/client)
+npm install throttlekit redis
+
+# Upstash REST client (serverless / edge — Vercel, Cloudflare, Deno, Bun)
+npm install throttlekit @upstash/redis
+```
+
+## Supported clients
+
+ThrottleKit normalizes three different Redis client APIs into a single internal interface. Pass the result of the appropriate adapter as the `client` option.
+
+| Client | Package | Adapter | Notes |
+|---|---|---|---|
+| ioredis | `ioredis` | `fromIoredis(client)` or pass directly | Full support — Lua + OCC |
+| node-redis | `redis` | `fromNodeRedis(client)` | Full support — Lua + OCC |
+| Upstash REST | `@upstash/redis` | `fromUpstash(client)` | Lua-backed (built-in) strategies only |
+
+<Note>
+  The Upstash REST API has no interactive `WATCH`/`MULTI` support, so custom
+  strategies that require optimistic concurrency will throw a
+  `StoreUnavailableError` at runtime rather than silently corrupt state. All
+  built-in algorithms (GCRA, token bucket, sliding window, etc.) use the Lua
+  path and work fully on Upstash.
+</Note>
+
+## Quick example
+
+<CodeGroup>
+
+```ts ioredis
+import Redis from "ioredis";
+import { rateLimit, gcra } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+
+const client = new Redis(process.env.REDIS_URL!);
+
+// RedisStore derives `now` from the Redis server clock by default,
+// so node clock skew can't corrupt shared state.
+const store = new RedisStore({ client, prefix: "tk" });
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000, burst: 100 }),
+  store, // one atomic EVALSHA per check
+  prefix: "api",
+});
+
+const result = await limiter.check("user-42");
+console.log(result.allowed, result.remaining, result.limit);
+
+// Spend a larger cost in one atomic check
+const heavy = await limiter.check("user-42", 10);
+console.log(heavy.allowed, heavy.remaining);
+
+await client.quit();
+```
+
+```ts node-redis
+import { createClient } from "redis";
+import { rateLimit, gcra } from "throttlekit";
+import { RedisStore, fromNodeRedis } from "throttlekit/redis";
+
+const client = createClient({ url: process.env.REDIS_URL });
+await client.connect();
+
+const store = new RedisStore({
+  client: fromNodeRedis(client),
+  prefix: "tk",
+});
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000, burst: 100 }),
+  store,
+  prefix: "api",
+});
+
+const result = await limiter.check("user-42");
+console.log(result.allowed, result.remaining);
+
+await client.quit();
+```
+
+```ts upstash
+import { Redis } from "@upstash/redis";
+import { rateLimit, gcra } from "throttlekit";
+import { RedisStore, fromUpstash } from "throttlekit/redis";
+
+const upstash = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
+
+const store = new RedisStore({
+  client: fromUpstash(upstash),
+  prefix: "tk",
+});
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 500, periodMs: 60_000, burst: 50 }),
+  store,
+});
+
+const result = await limiter.check("user-42");
+console.log(result.allowed, result.remaining);
+```
+
+</CodeGroup>
+
+## Options
+
+<ParamField path="client" type="RedisClientLike" required>
+  A Redis client instance. Pass an `ioredis` client directly, or wrap a
+  `node-redis` client with `fromNodeRedis()`, or an Upstash client with
+  `fromUpstash()`.
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Storage key namespace. Keys are stored as `prefix:key`. Use this to share one
+  Redis instance across multiple limiters without key collisions.
+</ParamField>
+
+<ParamField path="useLua" type="boolean" default="true">
+  When `true`, built-in strategies execute their atomic Lua form via `EVALSHA`
+  (with an `EVAL` fallback on `NOSCRIPT`). Set `false` to force all applies
+  through the optimistic-concurrency path — useful for debugging or testing the
+  OCC code path.
+</ParamField>
+
+<ParamField path="useServerTime" type="boolean" default="true">
+  Derive `now` from the Redis server clock (`TIME`) inside the Lua script so
+  that node clock skew cannot corrupt shared state. Set `false` only for
+  deterministic tests that supply an explicit `now`. This only affects the
+  absolute `resetAt` timestamp; relative duration fields are skew-free either
+  way.
+</ParamField>
+
+<ParamField path="maxRetries" type="number" default="5">
+  Maximum retry attempts for the optimistic-concurrency fallback
+  (`WATCH`/`MULTI`/`EXEC`). This path is only taken by custom strategies
+  without a Lua form. If all retries are exhausted a `StoreUnavailableError` is
+  thrown.
+</ParamField>
+
+<ParamField path="ttlFloorMs" type="number" default="0">
+  Floor in milliseconds on the physical Redis key TTL, independent of the
+  strategy's logical window. When `useServerTime: false` the logical clock is
+  decoupled from Redis real time — set a floor well above the window so a
+  logically-live key is never garbage-collected before its logical expiry.
+  Default `0` (the strategy's own TTL is used verbatim).
+</ParamField>
+
+## Atomicity
+
+Built-in strategies run their Lua form in a **single `EVALSHA` round trip**. Redis executes Lua scripts atomically — no other command can interleave within the script's execution — so N concurrent checks from any number of processes land exactly N decrements. On a `NOSCRIPT` error (the script cache was flushed by a Redis restart or failover), the store falls back to `EVAL` which re-caches the script for subsequent calls.
+
+For custom strategies that do not ship a Lua form, the store uses `WATCH`/`GET`/`MULTI`/`EXEC` optimistic concurrency: `EXEC` returning `null` is the "key changed under us" signal and triggers a retry, up to `maxRetries`.
+
+## Redis Cluster support
+
+All built-in strategies declare the keys they touch via `buildKeys(key)`. When a script needs multiple keys (e.g. a sliding-window log that touches both the counter and the timestamp sorted set), all keys are placed in the same hash slot by wrapping the key in a hash tag — `{key}` — so Redis Cluster never receives a `CROSSSLOT` error. Independent single-key strategies distribute naturally across the cluster.
+
+## Server clock as the authority
+
+When `useServerTime: true` (the default), the Lua script calls `redis.call('TIME')` to obtain the current timestamp. This means all rate-limit decisions for a given key are made against the **Redis server clock**, not the individual application node clocks. Multiple app nodes with skewed system clocks write into the same Redis key without divergence.
+
+<Tip>
+  For local development or unit tests, set `useServerTime: false` and inject a
+  `ManualClock` so you can advance time deterministically without depending on a
+  real Redis server clock.
+</Tip>
+
+## Failure behavior
+
+When Redis is unreachable, `apply` rejects with the underlying client connection error. The limiter's `fail` policy (`"open"` or `"closed"`) controls what that rejection means for your application. No rate-limit state is lost across a reconnect — the counter resumes from where it left off as long as Redis itself has not been flushed or restarted without persistence.
+
+<Warning>
+  A non-persistent Redis instance (no RDB/AOF) loses all rate-limit state on
+  restart, equivalent to a `MemoryStore` process restart. If your limits are
+  billing-critical or abuse-critical, enable Redis persistence or use a durable
+  backend such as Postgres or DynamoDB.
+</Warning>

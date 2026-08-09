@@ -1,0 +1,229 @@
+---
+title: "Two-Tier Limiting with L1 and L2"
+sidebarTitle: "Two-Tier Limiting"
+description: "Front a distributed store with an in-process L1 tier in strict, cached-deny, or leased mode. Leased mode has a TLA⁺-proven fleet-size-independent bound."
+---
+
+A purely distributed limiter pays one network round trip to a shared store on *every* request — exactly the wrong cost when traffic (and attacks) spike. ThrottleKit's two-tier engine fronts the distributed store (L2) with a local in-process tier (L1) and lets you choose the consistency/throughput trade-off per limiter, with a **provably bounded** global overshoot in leased mode.
+
+```
+request ─► L1 (in-process, sync)
+              │  decisive locally?  ──► return (0 network)
+              │  needs authority?   ──► L2 (Redis, atomic Lua) ──► update L1
+              ▼
+           Decision
+```
+
+## The three modes
+
+`twoTier` returns a `Limiter` with three selectable coordination modes:
+
+```ts
+import { twoTier, gcra } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+import Redis from "ioredis";
+
+const store = new RedisStore({ client: new Redis(process.env.REDIS_URL) });
+
+const limiter = twoTier({
+  strategy: gcra({ limit: 10_000, periodMs: 60_000, burst: 500 }),
+  l2: store,
+  mode: "leased",          // "strict" | "cached-deny" | "leased"
+  lease: { batch: 50, windowCoupled: true },
+});
+```
+
+| Mode | Network cost | Global accuracy | Best for |
+|---|---|---|---|
+| `strict` | 1 round trip / request | Exact | Hard quotas, billing |
+| `cached-deny` | 1 round trip / *allowed* request | Exact for allows, local for denies | Public APIs under abuse |
+| `leased` | ~1 round trip / `batch` requests | Provably bounded overshoot | High-throughput internal APIs |
+
+### strict — exact, one round trip per request
+
+Every check consults L2 directly. There is no local state; `strict` mode is equivalent to using `rateLimit` with a distributed store. Use it when global exactness matters more than throughput — billing quotas, hard contractual caps.
+
+```ts
+twoTier({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000 }),
+  l2: store,
+  mode: "strict",
+})
+```
+
+### cached-deny — protect the protector
+
+Allowed traffic still hits L2 (so allows stay globally exact), but **denials are cached locally** for their `retryAfterMs`. Once a key is over the limit, further requests are rejected from L1 with no round trip, so an abusive client cannot translate a flood of requests into L2 load.
+
+```ts
+twoTier({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  l2: store,
+  mode: "cached-deny",
+  l1: { maxKeys: 100_000 }, // bound the deny-cache map
+})
+```
+
+This is the recommended default for public-facing endpoints. Set `l1.maxKeys` to bound memory against a flood of unique (e.g. spoofed-IP) keys.
+
+### leased — near-zero network, bounded overshoot
+
+Each node atomically **leases a batch** of `B` credits from L2 in one round trip, then serves up to `B` requests entirely from L1 — no network at all. When the local budget is exhausted, the node leases another batch.
+
+```ts
+twoTier({
+  strategy: gcra({ limit: 10_000, periodMs: 60_000, burst: 500 }),
+  l2: store,
+  mode: "leased",
+  lease: {
+    batch: 50,              // lease 50 credits per round trip
+    windowCoupled: true,    // expire local credits at the L2 window boundary
+    lowWater: 10,           // proactively refill when credits drop to 10 (optional)
+    returnIdleAfterMs: 60_000, // return idle credits after 60 s (optional)
+  },
+})
+```
+
+## The overshoot bound
+
+In baseline leased mode (without `windowCoupled`), credits carry across window boundaries. The **tight** bound, machine-checked in TLA⁺:
+
+```
+admitted_per_window ≤ Limit + N × (Batch − 1)
+```
+
+where `N` is the number of nodes. Each node may hold up to `Batch − 1` unconsumed local credits from the prior window's last lease, so across `N` nodes that is up to `N × (Batch − 1)` extra admissions on top of a fresh full `Limit`.
+
+**`windowCoupled: true` collapses the bound to exactly `Limit`, independent of fleet size.** When the L2 window that granted a key's credits rolls over (`now >= lastDecision.resetAt`), those credits expire instead of carrying across the boundary. Since cross-window carryover was the only overshoot source:
+
+```
+admitted_per_window ≤ Limit    (for ANY number of nodes N)
+```
+
+This is proven in `spec/GaleWindowCoupledLeasing.tla` and reproduced by an exhaustive BFS checker that runs in CI.
+
+<Tip>
+  Set `windowCoupled: true` whenever you use a fixed-window L2 strategy (e.g. `fixedWindow`, `quota`). The cost is one re-lease per busy node just after each window boundary — a bounded, brief dip in utilization, not in safety.
+</Tip>
+
+## The lease lifecycle
+
+When a request arrives in `leased` mode, the check loop:
+
+1. **Serves locally** — if `credits >= cost`, decrement and return an allow. Zero network.
+2. **Leases on shortage** — when `credits < cost`, atomically lease `max(batch, cost)` from L2; on success, add the grant to local credits and retry.
+3. **Coalesces concurrent misses** — the in-flight lease promise is stored on the key entry; concurrent misses on the same key `await` the same promise instead of each issuing their own lease. This bounds a node to at most `batch` outstanding at any time — the assumption the overshoot bound rests on.
+4. **Surfaces global exhaustion** — when L2 is globally out of budget and nothing remains locally, the node returns L2's denial.
+
+```ts
+// The first check leases a batch from L2 (one round trip).
+// The next 49 are served from local credit with no L2 access at all.
+let allowed = 0;
+for (let i = 0; i < 60; i++) {
+  const d = await limiter.check("tenant-1");
+  if (d.allowed) allowed++;
+}
+console.log("allowed of 60:", allowed); // 60 — well within the 500-burst budget
+```
+
+## Full example: leased mode with MemoryStore as L2
+
+This example runs standalone and deterministically using `MemoryStore` as the L2, as in the [two-tier-leased example](https://github.com/AmeyaBorkar/throttlekit/blob/main/examples/two-tier-leased.ts):
+
+```ts
+import { ManualClock, MemoryStore, gcra, twoTier } from "throttlekit";
+
+const clock = new ManualClock(0);
+
+// Stand in for a distributed store.
+// In production: new RedisStore({ client: new Redis(url) })
+const l2 = new MemoryStore({ clock });
+
+const limiter = twoTier({
+  strategy: gcra({ limit: 10_000, periodMs: 60_000, burst: 500 }),
+  l2,
+  mode: "leased",
+  // Lease 50 tokens at a time; with the default lowWater (0) this is purely
+  // lease-on-demand, giving the tightest overshoot bound (<= L x batch).
+  lease: { batch: 50 },
+  clock,
+});
+
+// The first check leases a batch from L2 (one round trip); the next 49 are
+// served from local credit with no L2 access at all.
+let allowed = 0;
+for (let i = 0; i < 60; i++) {
+  const d = await limiter.check("tenant-1");
+  if (d.allowed) allowed++;
+}
+console.log("allowed of 60:", allowed); // 60 — well within the 500-burst budget
+
+// two-tier check is async (L2 is asynchronous); checkSync throws by design
+try {
+  limiter.checkSync("tenant-1");
+} catch (err) {
+  console.log("checkSync rejected as expected:", (err as Error).message);
+}
+```
+
+## The twoTier API
+
+```ts
+twoTier<S = unknown>(options: TwoTierOptions<S>): Limiter
+```
+
+<ResponseField name="strategy" type="Strategy" required>
+  The algorithm enforced at L2 (and the unit of the leased budget). Any built-in or custom strategy is accepted.
+</ResponseField>
+
+<ResponseField name="l2" type="Store" required>
+  The distributed store (e.g. `RedisStore`, `PostgresStore`, or any `Store` implementation).
+</ResponseField>
+
+<ResponseField name="mode" type='"strict" | "cached-deny" | "leased"' required>
+  The coordination mode. See the mode table above.
+</ResponseField>
+
+<ResponseField name="lease" type="LeaseOptions">
+  Required for `leased` mode. Controls the batch size, low-water mark, idle reclamation, and window coupling.
+
+  - `batch` — credits leased from L2 per round trip. Required unless `adaptive` is set.
+  - `lowWater` — proactively refill when local credits fall to this level (default `0`; purely on-demand).
+  - `windowCoupled` — expire credits at the L2 window boundary; collapses the overshoot bound to exactly `Limit` (default `false`).
+  - `returnIdleAfterMs` — return idle credits to L2 after this many ms (optional).
+  - `adaptive` — enable online EOQ lease sizing; the learner targets `√(2·orderCost·demand/strandPenalty)` per key (experimental).
+</ResponseField>
+
+<ResponseField name="l1" type="L1Options">
+  Local-tier tuning. `maxKeys` bounds the in-process maps (deny cache for `cached-deny`, credit entries for `leased`) against adversarial key floods.
+</ResponseField>
+
+<ResponseField name="clock" type="Clock">
+  Injected time source. Defaults to `systemClock`. Pass a `ManualClock` in tests.
+</ResponseField>
+
+<ResponseField name="prefix" type="string">
+  Key namespace — prepended to every key before it reaches L2. Lets one store back many independent limiters.
+</ResponseField>
+
+## windowCoupled and fleet-size independence
+
+`windowCoupled: true` is the keystone of GALE (ThrottleKit's provable distributed leasing engine). Here is the intuition:
+
+Without window coupling, each node can hold up to `Batch − 1` unconsumed credits from the *previous* window's last lease. At the window boundary, L2 resets to `Limit`, but those leftover credits are still valid — so `N` nodes each holding `Batch − 1` leftover credits can admit up to `Limit + N × (Batch − 1)` requests in the new window. This sum grows with `N`.
+
+With `windowCoupled: true`, leftover credits are **discarded** at the boundary. L2 starts the new window at `Limit`, and no node carries forward any prior-window credit. Global admissions in the new window therefore cannot exceed `Limit` — independent of how many nodes are in the fleet.
+
+<Warning>
+  `windowCoupled` only applies to strategies with a discrete window boundary (`fixedWindow`, `quota`). GCRA and token bucket pace continuously and do not have window boundaries — use them with `twoTier(leased)` without `windowCoupled`, accepting the `Limit + N × (Batch − 1)` bound instead.
+</Warning>
+
+## When to use each mode
+
+- **`strict`** — hard billing quotas, contractual per-user limits, any case where a single extra request is unacceptable. Pay one round trip per request.
+- **`cached-deny`** — public APIs under potential abuse, authentication endpoints, any case where an attacker hammering a blocked key should not cost you Redis load. Pays one round trip per *allowed* request.
+- **`leased`** — high-throughput internal APIs, service-to-service calls, any case where the round-trip cost of `strict` would dominate latency. Pays approximately one round trip per `batch` requests, with a known overshoot you choose.
+
+<Info>
+  `leased` mode is opt-in, not the default. It trades a small, bounded global overshoot for throughput. That is the right call for high-traffic internal services but wrong for hard billing quotas — always use `strict` or `cached-deny` for the latter.
+</Info>

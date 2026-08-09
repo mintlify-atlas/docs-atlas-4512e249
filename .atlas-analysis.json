@@ -1,0 +1,162 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "ThrottleKit",
+  "projectDescription": "A TypeScript rate-limiting SDK for Node and the web with provably bounded distributed leasing (GALE/TALE), 169 ns sync API, eight algorithms, six storage backends, and 13 framework adapters — zero runtime dependencies.",
+  "theme": "luma",
+  "primaryColor": "#7c7c79",
+  "lightColor": "#050505",
+  "darkColor": "#eae8d9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/decision",
+              "concepts/strategies",
+              "concepts/stores",
+              "concepts/two-tier"
+            ]
+          },
+          {
+            "group": "Algorithms",
+            "pages": [
+              "algorithms/gcra",
+              "algorithms/token-bucket",
+              "algorithms/fixed-window",
+              "algorithms/sliding-window",
+              "algorithms/leaky-bucket",
+              "algorithms/quota",
+              "algorithms/adaptive-concurrency"
+            ]
+          },
+          {
+            "group": "Storage Backends",
+            "pages": [
+              "stores/memory",
+              "stores/redis",
+              "stores/postgres",
+              "stores/dynamodb",
+              "stores/edge"
+            ]
+          },
+          {
+            "group": "Framework Adapters",
+            "pages": [
+              "adapters/overview",
+              "adapters/node-frameworks",
+              "adapters/edge-serverless"
+            ]
+          },
+          {
+            "group": "Advanced Features",
+            "pages": [
+              "advanced/distributed-leasing",
+              "advanced/unified-admission",
+              "advanced/multi-dimensional",
+              "advanced/sketch-ddos",
+              "advanced/observability",
+              "advanced/policy-plans",
+              "advanced/cli"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/rate-limit",
+              "api/two-tier",
+              "api/types"
+            ]
+          },
+          {
+            "group": "Subpath Exports",
+            "pages": [
+              "api/subpaths/redis",
+              "api/subpaths/postgres",
+              "api/subpaths/adapters",
+              "api/subpaths/admission",
+              "api/subpaths/policy-testkit"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "169 ns synchronous checkSync API — allocation-free, zero-await hot path",
+    "GALE: TLA⁺-verified fleet-size-independent overshoot bound for distributed leasing",
+    "TALE: LLM token-budget escrow with provably bounded post-hoc cost metering",
+    "Eight rate-limiting algorithms: GCRA, token bucket, fixed/sliding window, leaky bucket, quota, adaptive concurrency",
+    "Six storage backends (in-memory, Redis, Postgres, DynamoDB, Deno KV, Cloudflare) proven bit-identical via conformance vectors",
+    "13 framework/transport adapters: Express, Fastify, Koa, Hono, Next.js, NestJS, SvelteKit, Remix, Elysia, fetch, Lambda, tRPC, gRPC",
+    "Multi-dimensional limiting — compose per-IP ∧ per-user ∧ per-route in one round trip",
+    "Unified rate × concurrency × cost admission with optional joint-LP bid-price filter",
+    "Fixed-memory DDoS sketch (Count-Min Sketch, ~7.4 KB) for unbounded key universes",
+    "Policy Plans: replay recorded traffic against a candidate policy to preview allow↔deny changes before deploy",
+    "Zero runtime dependencies — 24 tree-shakeable subpath entry points",
+    "ThrottleKit Lens: zero-dependency terminal monitoring dashboard with live binding-axis attribution"
+  ],
+  "publicApiSurface": [
+    "rateLimit(options: RateLimitOptions): Limiter",
+    "twoTier(options: TwoTierOptions): Limiter",
+    "gcra(options: GcraOptions): Strategy",
+    "tokenBucket(options: TokenBucketOptions): Strategy",
+    "fixedWindow(options: FixedWindowOptions): Strategy",
+    "slidingWindow(options: SlidingWindowOptions): Strategy",
+    "slidingWindowLog(options: SlidingWindowLogOptions): Strategy",
+    "leakyBucket(options: LeakyBucketOptions): Shaper",
+    "quota(options: QuotaOptions): Strategy",
+    "adaptiveConcurrency(options: AdaptiveConcurrencyOptions): ConcurrencyGuard",
+    "distributedAdaptiveConcurrency(options): DistributedConcurrencyGuard",
+    "MemoryStore — built-in (throttlekit)",
+    "RedisStore — throttlekit/redis",
+    "PostgresStore — throttlekit/postgres",
+    "DynamoDBStore — throttlekit/dynamodb",
+    "DenoKvStore — throttlekit/deno",
+    "CloudflareStore — throttlekit/cloudflare",
+    "expressRateLimit — throttlekit/express",
+    "fastifyRateLimit — throttlekit/fastify",
+    "koaRateLimit — throttlekit/koa",
+    "honoRateLimit — throttlekit/hono",
+    "withRateLimit — throttlekit/fetch",
+    "nextRateLimit — throttlekit/next",
+    "nestRateLimit — throttlekit/nest",
+    "sveltekitRateLimit — throttlekit/sveltekit",
+    "remixRateLimit — throttlekit/remix",
+    "elysiaRateLimit — throttlekit/elysia",
+    "trpcRateLimit — throttlekit/trpc",
+    "grpcRateLimit — throttlekit/grpc",
+    "lambdaRateLimit — throttlekit/lambda",
+    "createEnforcer(options): Enforcer",
+    "multiRateLimit / all / any — throttlekit (multi-dimensional)",
+    "unifiedAdmission — throttlekit (unified rate×concurrency×cost)",
+    "tokenBudget / distributedTokenBudget — throttlekit (TALE LLM token metering)",
+    "weightedFairEscrow / federatedWeightedFairEscrow — throttlekit",
+    "sketchRateLimit — throttlekit (Count-Min Sketch DDoS)",
+    "withAnalytics — throttlekit",
+    "tapDecisions — throttlekit",
+    "policy / policySet / plan / renderPlan — throttlekit/policy",
+    "recordLimiter — throttlekit/testkit",
+    "loadConfig — throttlekit/config",
+    "buildRateLimitHeaders — throttlekit (HTTP headers)",
+    "clientIp / hashKey / hmacKeyer — throttlekit (security helpers)",
+    "Limiter.check / checkSync / checkMany / peek / forecast / reset",
+    "Decision: { allowed, limit, remaining, resetAt, retryAfterMs }",
+    "throttlekit CLI: benchmark | doctor | replay"
+  ]
+}

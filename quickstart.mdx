@@ -1,47 +1,208 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get started with ThrottleKit"
+sidebarTitle: "Quickstart"
+description: "Install ThrottleKit, create your first in-memory limiter, inspect a Decision, and scale to distributed Redis — all in under five minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+ThrottleKit is designed so the simplest path — an in-memory GCRA limiter with a synchronous fast path — takes three lines of code, and the path to a provably-bounded distributed fleet is one additional option object. This guide walks you through both.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+<Step title="Install the package">
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+ThrottleKit has zero runtime dependencies. Install it with your package manager of choice:
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
+```bash
+npm install throttlekit
+```
+
+For distributed use with Redis, also install `ioredis` (or `node-redis`):
+
+```bash
+npm install throttlekit ioredis
+```
+
+Node.js **18 or later** is required.
+
+</Step>
+
+<Step title="Create your first limiter">
+
+The default store is an in-process `MemoryStore`. No infrastructure needed.
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+
+// 100 requests per minute, with an instantaneous burst allowance of 20
+const limiter = rateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+  // store defaults to a fresh in-process MemoryStore
+});
+```
+
+`rateLimit` binds a strategy to a store and returns a `Limiter`. The `gcra` strategy stores a single timestamp per key and paces traffic smoothly — it is the recommended default.
+
+</Step>
+
+<Step title="Make your first check">
+
+Every check returns an immutable `Decision` object. There are two check paths — async and sync:
+
+```ts
+// Async path — works with any store, including Redis
+const decision = await limiter.check("user-42");         // cost defaults to 1
+console.log("allowed:", decision.allowed);
+console.log("remaining:", decision.remaining);
+
+// Sync path — allocation-free, 169 ns/op, MemoryStore only
+const syncDecision = limiter.checkSync("ip-1.2.3.4");
+console.log("sync allowed:", syncDecision.allowed, "limit:", syncDecision.limit);
+```
+
+You can also charge a higher cost for expensive operations:
+
+```ts
+// Spend 5 units in one atomic check (e.g. for a bulk upload endpoint)
+const heavy = await limiter.check("user-42", 5);
+console.log("heavy (cost 5) allowed:", heavy.allowed, "remaining:", heavy.remaining);
+```
+
+</Step>
+
+<Step title="Handle the Decision">
+
+A `Decision` carries everything you need to respond to the client, set headers, and schedule retries:
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 5, periodMs: 1_000 }),
+});
+
+async function handleRequest(userId: string) {
+  const d = await limiter.check(userId);
+
+  if (!d.allowed) {
+    // d.retryAfterMs — how long to wait before retrying (0 when allowed)
+    // d.resetAt      — epoch-ms when the limiter is fully replenished
+    throw new Error(`Rate limited. Retry in ${Math.ceil(d.retryAfterMs / 1000)}s`);
+  }
+
+  // d.allowed    — whether the request is permitted
+  // d.limit      — effective ceiling (burst capacity or window quota)
+  // d.remaining  — whole units remaining before the next rejection
+  console.log(`Allowed. ${d.remaining} of ${d.limit} remaining.`);
+}
+```
+
+Use `limiter.peek(key)` to read the current capacity **without consuming** it — useful for rendering quota dashboards:
+
+```ts
+const capacity = await limiter.peek("user-42");
+console.log(`${capacity.remaining} requests remaining, resets at ${new Date(capacity.resetAt)}`);
+```
+
+</Step>
+
+<Step title="Go distributed with Redis">
+
+Switch from in-memory to Redis by providing a `RedisStore`. The strategy, API, and `Decision` shape are identical — only the store changes.
+
+```ts
+import Redis from "ioredis";
+import { gcra, rateLimit } from "throttlekit";
+import { RedisStore } from "throttlekit/redis";
+
+const client = new Redis(process.env.REDIS_URL);
+
+// RedisStore derives `now` from the Redis server clock by default,
+// so node clock skew cannot corrupt shared state across processes.
+const store = new RedisStore({ client, prefix: "tk" });
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000, burst: 100 }),
+  store, // one atomic EVALSHA per check
+  prefix: "api",
+});
+
+const key = "user-42";
+await limiter.reset(key); // start clean for a repeatable demo
+
+const a = await limiter.check(key);
+console.log("allowed:", a.allowed, "remaining:", a.remaining, "limit:", a.limit);
+
+// Spend a larger cost in one atomic check
+const b = await limiter.check(key, 10);
+console.log("cost-10 allowed:", b.allowed, "remaining:", b.remaining);
+
+await client.quit();
+```
+
+Each `check` call runs a single atomic `EVALSHA` Lua script on the Redis server — one round trip, no race conditions, no `WATCH`/`MULTI` retry loops.
+
+</Step>
+
+<Step title="Use deterministic time in tests">
+
+Inject a `ManualClock` to make every time-dependent test fully deterministic — no `Date.now()` inside any algorithm:
+
+```ts
+import { ManualClock, MemoryStore, gcra, rateLimit } from "throttlekit";
+
+const clock = new ManualClock(0);
+const limiter = rateLimit({
+  strategy: gcra({ limit: 2, periodMs: 1_000 }), // burst defaults to limit (2)
+  clock,
+  store: new MemoryStore({ clock }),
+});
+
+// A cold bucket admits exactly `burst` requests instantaneously
+console.log("t=0  #1:", limiter.checkSync("k").allowed); // true
+console.log("t=0  #2:", limiter.checkSync("k").allowed); // true
+console.log("t=0  #3:", limiter.checkSync("k").allowed); // false — burst exhausted
+
+clock.advance(500); // one emission interval (periodMs / limit = 1000 / 2) later
+console.log("t=500 #4:", limiter.checkSync("k").allowed); // true
+```
+
+</Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## What's in a Decision
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+Every `check`, `checkSync`, `peek`, and `peekSync` call returns a `Decision`:
+
+```ts
+interface Decision {
+  readonly allowed: boolean;      // permit or reject
+  readonly limit: number;         // effective ceiling (burst capacity or window quota)
+  readonly remaining: number;     // whole units left before rejection; never negative
+  readonly resetAt: number;       // epoch-ms when the limiter is fully replenished
+  readonly retryAfterMs: number;  // 0 when allowed; otherwise how long to wait (ms)
+}
+```
+
+All numeric fields are integers — this is what makes the JavaScript and Redis-Lua execution paths produce **bit-identical** values.
+
+<Note>
+  `Decision` is a **producer** type — the library creates it, you read it. Per the 1.x stability contract it may grow by appending new optional `readonly` fields in future minor releases. Do not use `zod.strict()` or exhaustive property validation on a `Decision`.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="package" href="/installation">
+    All package manager commands, Node.js requirements, and the full list of 24 subpath entry points.
+  </Card>
+  <Card title="Decision" icon="circle-check" href="/concepts/decision">
+    Deep dive into every field of the Decision interface, peek vs check, and forecast.
+  </Card>
+  <Card title="Strategies" icon="function" href="/concepts/strategies">
+    Choose the right algorithm: GCRA, token bucket, sliding window, fixed window, and more.
+  </Card>
+  <Card title="Two-Tier Limiting" icon="server" href="/concepts/two-tier">
+    L1 + L2 architecture for near-zero network cost with a provable overshoot bound.
+  </Card>
+</CardGroup>

@@ -1,0 +1,359 @@
+---
+title: "Unified Admission"
+sidebarTitle: "Unified Admission"
+description: "Compose rate, concurrency, and token-cost axes into one admit() call, one lease lifecycle, and one binding-axis signal with the TALE engine."
+---
+
+A real API request must clear several orthogonal admission gates at once: a **rate** ceiling (requests per minute), a **concurrency** ceiling (slots in flight), and a **cost** budget (tokens or compute units per window). Without `unifiedAdmission`, you must chain these checks manually and carefully manage concurrency slot leaks when a downstream axis denies. The TALE engine collapses all three into one `admit()` call with a single combined `Decision`, a single `release` hook, and a single observable `bindingAxis` that tells you which constraint actually bit.
+
+## `unifiedAdmission()`
+
+```ts
+import {
+  unifiedAdmission,
+  rateLimit,
+  adaptiveConcurrency,
+  gcra,
+  tokenBucket,
+} from "throttlekit";
+
+const admit = unifiedAdmission({
+  rate: rateLimit({ strategy: gcra({ limit: 60, periodMs: 60_000 }) }),
+  concurrency: adaptiveConcurrency({ minLimit: 4, maxLimit: 16 }),
+  cost: rateLimit({ strategy: tokenBucket({ capacity: 100_000, refillPerSec: 1_667 }) }),
+});
+
+// In a request handler:
+const { decision, release } = await admit.admit({
+  key: req.user.id,
+  cost: req.body.maxTokens ?? 1_000,
+});
+
+if (!decision.allowed) {
+  res.status(429).json({ retryAfterMs: decision.retryAfterMs });
+  return;
+}
+
+res.on("finish", () => release({ dropped: false }));
+res.on("close", () => release({ dropped: true }));
+```
+
+Every configured axis is optional — you can wire only rate + concurrency, only cost, or any combination. At least one axis must be set.
+
+### `UnifiedAdmissionOptions`
+
+<ParamField path="rate" type="Limiter">
+  The rate axis. Checked as `rate.check(key, 1)`.
+</ParamField>
+
+<ParamField path="concurrency" type="ConcurrencyGuard">
+  The concurrency axis, from `adaptiveConcurrency(...)`. State is in-process; the slot is acquired synchronously.
+</ParamField>
+
+<ParamField path="cost" type="Limiter">
+  The cost axis. Checked as `cost.check(key, opts.cost)`.
+</ParamField>
+
+<ParamField path="backend" type='"sequential" | "lua-fused"'>
+  `"sequential"` (default) evaluates axes in order; first deny short-circuits. `"lua-fused"` collapses rate + cost into one Redis `EVALSHA` for atomic evaluation. Concurrency always remains in-process. Requires the `fused` option group; supports GCRA + token-bucket only.
+</ParamField>
+
+<ParamField path="policy" type='"marginal" | "joint-lp"'>
+  `"marginal"` (default): admit when every axis independently has slack. `"joint-lp"`: additionally apply a bid-price filter — see the joint-LP section below.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Injected time source, forwarded to the concurrency-lease shim. Defaults to the system clock.
+</ParamField>
+
+---
+
+## The Decision Algebra
+
+`combineDecisions` composes any two `Decision` objects into one via:
+
+```
+combine(a, b) = {
+  allowed:      a.allowed && b.allowed,         // AND
+  limit:        min(a.limit, b.limit),           // binding ceiling
+  remaining:    min(a.remaining, b.remaining),
+  resetAt:      max(a.resetAt, b.resetAt),       // dominant wait
+  retryAfterMs: max(a.retryAfterMs, b.retryAfterMs),
+}
+```
+
+This algebra is **commutative, associative, and idempotent**, with `ALLOW_FULL` as the identity element. These properties license the `lua-fused` path to reorder its checks and still produce a result byte-identical to sequential.
+
+The evaluation order — **concurrency → rate → cost** — is chosen purely to minimize short-circuit cost (concurrency is in-process, the cheapest to evaluate). The combined result is order-independent by commutativity.
+
+---
+
+## `UnifiedAdmitOptions`
+
+<ParamField path="key" type="string">
+  Key passed to the rate and cost axes. Defaults to `""` (a single global bucket).
+</ParamField>
+
+<ParamField path="cost" type="number">
+  Cost weight passed to the cost axis. Defaults to `1`.
+</ParamField>
+
+<ParamField path="value" type="number">
+  Request value for the joint-LP bid-price test. Ignored unless `policy: "joint-lp"`. Defaults to `1`.
+</ParamField>
+
+<ParamField path="hold" type="number">
+  Expected service time for the 3-axis joint-LP concurrency term. Ignored unless `policy: "joint-lp"` with a concurrency budget configured. Defaults to `0` (no concurrency term).
+</ParamField>
+
+---
+
+## `UnifiedAdmitter` Interface
+
+```ts
+interface UnifiedAdmitter {
+  admit(opts?: UnifiedAdmitOptions): Promise<UnifiedAdmission>;
+  admitSync(opts?: UnifiedAdmitOptions): UnifiedAdmission;
+  lastDecisions(): Readonly<Partial<Record<UnifiedAxis, Decision | undefined>>>;
+}
+```
+
+- **`admit()`** — async; works for any backend mix.
+- **`admitSync()`** — synchronous; throws when any configured axis uses an async-only store, or when `backend: "lua-fused"` is active.
+- **`lastDecisions()`** — returns a snapshot of the most recent `admit` call's per-axis `Decision` objects. Unconfigured or short-circuited axes are `undefined`, letting you identify the binding axis precisely.
+
+The `UnifiedAxis` type is `"rate" | "concurrency" | "cost"`.
+
+---
+
+## Concurrency Lifecycle
+
+When the concurrency axis admits, the returned `release` function holds the concurrency slot. You **must** call `release()` when the work finishes — from a `finally` block, a response `finish` event, or similar. `release` is idempotent.
+
+```ts
+const { decision, release, bindingAxis } = await admit.admit({ key: userId, cost: tokens });
+
+if (!decision.allowed) {
+  console.log("denied by:", bindingAxis); // "rate" | "concurrency" | "cost" | undefined
+  return;
+}
+
+try {
+  await doWork();
+} finally {
+  release({ dropped: false }); // normal completion
+  // or: release({ dropped: true }) on timeout/error to signal overload
+}
+```
+
+If a downstream axis (rate or cost) denies after concurrency was acquired, the slot is **released immediately** (with `dropped: false`) and the returned `release` becomes a no-op.
+
+---
+
+## Token Budget
+
+`tokenBudget` is the post-hoc cost meter for LLM streaming: debit actual tokens as they are produced, not reserves at admission.
+
+```ts
+import { tokenBudget } from "throttlekit/admission";
+
+const meter = tokenBudget({ budget: 100_000, windowMs: 60_000 });
+
+for await (const tok of completion) {
+  if (!meter.debitSync(1).allowed) break; // budget spent — stop generating
+  emit(tok);
+}
+```
+
+Per-token debiting (`tokens = 1`) achieves **zero overshoot** — the budget stops precisely at `L`. The debit that crosses `L` is admitted in full; the next debit is refused.
+
+`distributedTokenBudget` is the fleet-shared, `Store`-backed version: the same stop-at-boundary rule run as an atomic read-modify-write against a shared counter, enforcing one budget `L` across every gateway with a per-token overshoot of 0 independent of fleet size.
+
+---
+
+## `learnedReservation` and `predictiveReservation`
+
+These TALE Layer 2 and 3 primitives learn the per-request token **reservation** that paces admission over a `tokenBudget`, minimizing the asymmetric newsvendor / pinball loss.
+
+```ts
+import { learnedReservation, tokenBudget } from "throttlekit/admission";
+
+const meter  = tokenBudget({ budget: 100_000, windowMs: 60_000 });
+const policy = learnedReservation({
+  holdCost: 1,
+  overrunCost: 4,
+  maxReservation: 4_096,
+});
+
+// At admission:
+if (policy.reserve() <= meter.remaining()) {
+  let produced = 0;
+  for await (const tok of completion) {
+    if (!meter.debitSync(1).allowed) break;
+    produced++;
+    emit(tok);
+  }
+  policy.observe(produced); // learn from the realised cost
+}
+```
+
+`predictiveReservation` extends this with a Hedge meta-learner that blends a per-request output-length prediction against the robust `learnedReservation` quantile. Accurate predictions drive cost to the clairvoyant optimum (consistency); adversarial predictions fall back to the no-regret quantile (robustness). Safety is unchanged in both cases.
+
+---
+
+## Fairness Primitives
+
+### `weightedMaxMin`
+
+Batch allocation of an integer `limit` across tenants with per-tenant `demands` and `weights`. Returns the exact, work-conserving weighted max-min split as an array of integer credits.
+
+```ts
+import { weightedMaxMin } from "throttlekit/admission";
+
+const credits = weightedMaxMin(
+  [800, 400, 200],    // demands
+  [4, 2, 1],          // weights (enterprise, pro, free)
+  1000                // total limit
+);
+// credits = [571, 286, 143]  (weighted water-fill, ≤ demand, sum = 1000)
+```
+
+### `weightedFairShare`
+
+The streaming, per-arrival face of `weightedMaxMin`: a global fixed-window budget split so each tenant's ceiling is proportional to its weight. Returns a `WeightedFairShareLimiter`.
+
+```ts
+import { weightedFairShare } from "throttlekit/admission";
+
+const limiter = weightedFairShare({
+  limit: 1_000,
+  windowMs: 60_000,
+  weightOf: (tenant) => tenantWeight(tenant),
+});
+
+const d = limiter.checkSync("enterprise:alpha", 100, 4); // cost=100, weight=4
+```
+
+---
+
+## `adaptiveThrottle` — Google SRE Client-Side Load Shedding
+
+`adaptiveThrottle` implements the Google SRE Book Chapter 21 client-side adaptive throttling formula. A client that keeps hammering an overloaded backend only deepens the overload; this sheds a growing fraction of requests **locally** (before they leave the client) based on the backend's recent accept rate:
+
+```
+p = max(0, (requests − K × accepts) / (requests + 1))
+```
+
+```ts
+import { adaptiveThrottle } from "throttlekit/admission";
+
+const throttle = adaptiveThrottle({ k: 2, windowMs: 10_000 });
+
+// Before each outbound call:
+if (throttle.request()) {
+  const ok = await callBackend();
+  throttle.record(ok); // feed back: accepted or rejected
+} else {
+  // shed locally — do not call the backend
+}
+```
+
+The `k` parameter controls aggressiveness: `K = 2` (the SRE Book default) begins shedding once the backend is rejecting more than 50% of requests. The `priority` argument to `request(priority)` scales the shed probability by `(1 − priority)` — a `priority` of `1` is never shed.
+
+---
+
+## Joint-LP Bid-Price Filter (`policy: "joint-lp"`)
+
+The default `"marginal"` policy admits whenever each axis independently has slack, but is blind to the *joint value* of spending a scarce cost unit on a low-value request. The `"joint-lp"` policy prices the scarce budgets and rejects requests whose value doesn't clear the bid price:
+
+```
+admit iff: value ≥ p_R + p_C × cost
+```
+
+The bid prices `p_R` (rate) and `p_C` (cost) are the LP dual variables of the revenue-management fluid relaxation. ThrottleKit solves this zero-dependency via `solveFluidLp`:
+
+```ts
+const admit = unifiedAdmission({
+  rate: rateLimiter,
+  cost: costLimiter,
+  policy: "joint-lp",
+  jointLp: {
+    workload: {
+      types: [
+        { cost: 200,   value: 1, weight: 0.7 },  // small completions
+        { cost: 8_000, value: 3, weight: 0.3 },  // large completions
+      ],
+      rateBudget: 60,
+      costBudget: 100_000,
+    },
+  },
+});
+
+// Per-request: provide a value signal
+const { decision } = await admit.admit({
+  key: userId,
+  cost: requestedTokens,
+  value: requestPriority,
+});
+```
+
+The filter runs **before** any rate/cost debit — a rejected low-value request does not consume the budget the policy exists to preserve. It is strictly more selective than `"marginal"` and cannot break any safety property.
+
+<Note>
+**Online dual refinement** is available with `jointLp.adaptive: { sampleWindow: N }`. During the first `N` policy-evaluated requests the filter prices with the construction prior while tallying the observed `(cost, value)` mixture; at the window boundary it re-solves and adopts the learned duals only if they strictly beat the prior on the buffered sample — otherwise keeps the prior. This guarantees never-worse-than-prior on the observed sample.
+</Note>
+
+---
+
+## Full LLM Gateway Example
+
+```ts
+import {
+  ManualClock,
+  adaptiveConcurrency,
+  gcra,
+  rateLimit,
+  tokenBucket,
+  unifiedAdmission,
+} from "throttlekit";
+import { bindingAxisOf } from "throttlekit/observability";
+
+const clock = new ManualClock(0);
+
+const admit = unifiedAdmission({
+  rate: rateLimit({ strategy: gcra({ limit: 60, periodMs: 60_000 }), clock }),
+  concurrency: adaptiveConcurrency({ clock, minLimit: 4, initialLimit: 4, maxLimit: 4 }),
+  cost: rateLimit({
+    strategy: tokenBucket({ capacity: 100_000, refillPerSec: 100_000 / 60 }),
+    clock,
+  }),
+  clock,
+});
+
+const calls = [
+  { tenant: "alice", tokens: 200 },
+  { tenant: "bob",   tokens: 8_000 },
+];
+
+const heldReleases: Array<() => void> = [];
+for (const call of calls) {
+  const { decision, release } = admit.admitSync({ key: call.tenant, cost: call.tokens });
+  if (decision.allowed) {
+    heldReleases.push(release);
+  } else {
+    const axis = bindingAxisOf(admit.lastDecisions());
+    console.log(`denied by ${axis}: retryAfter ${decision.retryAfterMs}ms`);
+  }
+}
+
+// Release all held slots when work completes
+for (const r of heldReleases) r();
+```
+
+<Accordion title="FAQ: When should I use admitSync vs admit?">
+Use `admitSync` only when every configured axis uses an in-process synchronous store (e.g. `MemoryStore`), and `backend` is `"sequential"`. With a Redis-backed rate or cost limiter, use the async `admit()`. `admitSync` with `backend: "lua-fused"` always throws.
+</Accordion>
+
+<Accordion title="FAQ: What does policyDenied mean on the result?">
+When `policy: "joint-lp"` is configured and the bid-price filter rejects a request (all axes had slack, but `value < p_R + p_C × cost`), the returned `UnifiedAdmission` has `policyDenied: true` and `bindingAxis` is absent. No axis budget was consumed. Use this flag to distinguish a policy filter rejection from a true resource exhaustion.
+</Accordion>

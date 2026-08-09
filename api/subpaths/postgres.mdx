@@ -1,0 +1,190 @@
+---
+title: "throttlekit/postgres — Postgres Store"
+sidebarTitle: "Postgres Store"
+description: "Distributed Store backed by PostgreSQL using per-key advisory locks for atomic read-modify-write. No Redis required; full Store interface compatibility."
+---
+
+`throttlekit/postgres` provides `PostgresStore` — a distributed `Store` backed by PostgreSQL. Every
+apply runs the limiter's existing pure JS transform inside a transaction, serialized per key by a
+transaction-scoped **advisory lock**. This makes concurrent applies on one key atomic without
+requiring Redis.
+
+```ts
+import { PostgresStore } from "throttlekit/postgres";
+import { Pool } from "pg";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const store = new PostgresStore({ pool });
+```
+
+## PostgresStore
+
+```ts
+class PostgresStore implements Store {
+  constructor(options: PostgresStoreOptions)
+  apply<S, R>(key: string, transform: Transform<S, R>): Promise<R>
+  reset(key: string): Promise<void>
+  close(): Promise<void>
+}
+```
+
+`PostgresStore` is an async-only store — it does not implement `applySync`. Use
+`await limiter.check(key)` on all Postgres-backed limiters.
+
+### Options
+
+<ParamField body="pool" type="PgPoolLike" required>
+  A `pg.Pool` (or any compatible object with `connect()` and `query()` methods). ThrottleKit never
+  ends a pool it does not own — `close()` on the store only stops the background sweep timer.
+</ParamField>
+
+<ParamField body="table" type="string">
+  Unquoted table identifier holding the limiter state. Validated against
+  `^[A-Za-z_][A-Za-z0-9_]*$` (optionally `schema.table`). Default `"throttlekit"`.
+</ParamField>
+
+<ParamField body="prefix" type="string">
+  Storage key namespace, prefixed as `prefix:key`.
+</ParamField>
+
+<ParamField body="autoCreate" type="boolean">
+  Create the table and its expiry index on first use if they do not already exist. Default `true`.
+  Set `false` if you manage schema migrations separately.
+</ParamField>
+
+<ParamField body="sweepIntervalMs" type="number">
+  Interval in ms for the background sweep that reclaims expired rows. Default `60_000` (1 minute).
+  Set `0` to disable the sweep and rely entirely on lazy expiry (expired rows are invisible to reads
+  but not removed from disk).
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Time source for expiry decisions. Defaults to the system clock. Inject a `ManualClock` to drive
+  expiry deterministically in tests.
+</ParamField>
+
+## Advisory-Lock Transaction Mechanism
+
+Every `apply` call runs the following transaction:
+
+```sql
+BEGIN
+SELECT pg_advisory_xact_lock(hashtextextended($key, 0))  -- per-key critical section
+SELECT state FROM throttlekit WHERE key = $key AND expires_at > $now  -- lazy expiry on read
+<run transform(state) in JavaScript>
+INSERT INTO throttlekit (key, state, expires_at)
+  VALUES ($key, $state, $now + $ttlMs)
+  ON CONFLICT (key) DO UPDATE
+    SET state = EXCLUDED.state,
+        expires_at = EXCLUDED.expires_at
+COMMIT  -- releases the advisory lock automatically
+```
+
+The advisory lock (not `SELECT … FOR UPDATE`) is deliberate:
+
+- `FOR UPDATE` cannot lock a row that does not yet exist, so two first-touch transactions on a new
+  key could race and produce an incorrect result.
+- An advisory lock keyed by `hashtextextended(key, 0)` serializes all applies for that key whether
+  or not the row exists, and releases automatically at `COMMIT` / `ROLLBACK`.
+- Hash collisions only cause over-serialization of unrelated keys very rarely — correctness is
+  unaffected.
+
+This makes concurrent applies on one key atomic: N concurrent increments land exactly N, matching
+the Redis `EVALSHA` guarantee.
+
+## Schema
+
+When `autoCreate: true` (the default), `PostgresStore` creates the following schema on first use:
+
+```sql
+CREATE TABLE IF NOT EXISTS throttlekit (
+  key        TEXT    PRIMARY KEY,
+  state      TEXT    NOT NULL,
+  expires_at BIGINT  NOT NULL
+);
+CREATE INDEX IF NOT EXISTS throttlekit_expires_idx ON throttlekit (expires_at);
+```
+
+State is stored as JSON text (the same encoding as the Redis OCC path) so decisions are
+bit-identical across backends. The `expires_at` index powers the background sweep.
+
+## Expiry Semantics
+
+Expiry is keyed off the store's `Clock` (mirrors how Redis uses its server clock). Expired rows are
+filtered on every read via the `WHERE expires_at > $now` clause — they are immediately invisible
+without waiting for the sweep. The background sweep (`sweepIntervalMs`) removes them from disk to
+reclaim storage.
+
+Because every built-in strategy is idempotent with respect to stale state (a TAT in the past clamps
+to `now`, a bucket refills, a window resets), a slightly-late expiry can never change a decision.
+
+## Peer Dependency
+
+`PostgresStore` has `pg` as a peer dependency. Install it separately:
+
+```bash
+npm install pg
+# TypeScript users may also want:
+npm install --save-dev @types/pg
+```
+
+## Usage with rateLimit
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+import { PostgresStore } from "throttlekit/postgres";
+import { Pool } from "pg";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const store = new PostgresStore({
+  pool,
+  table: "rate_limits",
+  prefix: "api:v2",
+  autoCreate: true,
+  sweepIntervalMs: 30_000,
+});
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  store,
+});
+
+// Clean up on shutdown
+process.on("SIGTERM", async () => {
+  await store.close();   // stops the sweep timer
+  await pool.end();      // closes the pool (yours to manage)
+});
+```
+
+## Client Interface Types
+
+### `PgPoolLike`
+
+The minimal slice of a `pg.Pool` ThrottleKit uses. A `pg.Pool` satisfies this structurally.
+
+```ts
+interface PgPoolLike {
+  connect(): Promise<PgClientLike>;
+  query(text: string, values?: unknown[]): Promise<PgQueryResultLike>;
+}
+```
+
+### `PgClientLike`
+
+A checked-out pool client. Mirrors `pg`'s `PoolClient`.
+
+```ts
+interface PgClientLike {
+  query(text: string, values?: unknown[]): Promise<PgQueryResultLike>;
+  release(err?: unknown): void;
+}
+```
+
+### `PgQueryResultLike`
+
+```ts
+interface PgQueryResultLike {
+  rows: unknown[];
+}
+```

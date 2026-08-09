@@ -1,0 +1,411 @@
+---
+title: "Framework Adapter Subpaths"
+sidebarTitle: "Adapters"
+description: "Framework-specific middleware and handler factories for Express, Fastify, Koa, Hono, Next.js, NestJS, SvelteKit, Remix, Elysia, tRPC, gRPC, and AWS Lambda."
+---
+
+Every framework adapter in ThrottleKit is a thin layer over `createEnforcer` — it derives a key
+from the framework's request object, calls `enforce(key)`, and renders the `EnforceResult` in the
+framework's native response format. All adapters share the same `EnforceOptions` surface and emit
+the same standards-compliant headers.
+
+Install adapter subpaths alongside the core package — no separate npm package is required:
+
+```bash
+npm install throttlekit
+```
+
+## Shared Options
+
+All adapter factories accept the following common options in addition to their framework-specific
+ones. These are the fields of `EnforceOptions` (see the [Types reference](/api/types)).
+
+<ParamField body="strategy" type="Strategy">
+  Build an in-memory limiter from this strategy inline. Mutually exclusive with `limiter`.
+</ParamField>
+
+<ParamField body="limiter" type="Limiter">
+  A pre-built `Limiter` (e.g. from `rateLimit()` with a Redis store). Mutually exclusive with
+  `strategy`.
+</ParamField>
+
+<ParamField body="fail" type="FailMode">
+  Behavior when the store is unreachable: `"open"` (admit) or `"closed"` (deny). Default `"open"`.
+</ParamField>
+
+<ParamField body="emit" type="HeaderEmit">
+  Which rate-limit header families to send. Default `{ draft: true }` (IETF
+  `RateLimit-Limit/Remaining/Reset`).
+</ParamField>
+
+<ParamField body="policyName" type="string">
+  Policy name surfaced in structured headers. Defaults to `"default"`.
+</ParamField>
+
+<ParamField body="onLimited" type="(key: string, decision: Decision) => void">
+  Callback fired on every `429` response.
+</ParamField>
+
+<ParamField body="onError" type="(key: string, err: unknown) => void">
+  Callback fired when the store throws, before the fail policy is applied.
+</ParamField>
+
+---
+
+## throttlekit/express
+
+```ts
+import { expressRateLimit } from "throttlekit/express";
+```
+
+Returns an Express middleware function `(req, res, next) => void`.
+
+```ts
+function expressRateLimit(options: EnforceOptions & {
+  keyFn?: (req: Request) => string;
+}): RequestHandler
+```
+
+<ParamField body="keyFn" type="(req: Request) => string">
+  Derive a rate-limit key from the Express request. Default: `clientIp` from the socket peer.
+</ParamField>
+
+```ts
+import express from "express";
+import { expressRateLimit } from "throttlekit/express";
+import { gcra } from "throttlekit";
+
+const app = express();
+app.use(
+  expressRateLimit({
+    strategy: gcra({ limit: 100, periodMs: 60_000 }),
+    keyFn: (req) => req.ip ?? req.socket.remoteAddress ?? "unknown",
+  })
+);
+```
+
+---
+
+## throttlekit/fastify
+
+```ts
+import { fastifyRateLimit } from "throttlekit/fastify";
+```
+
+Returns a Fastify plugin registered with `fastify.register()`.
+
+```ts
+function fastifyRateLimit(options: EnforceOptions & {
+  keyFn?: (request: FastifyRequest) => string;
+}): FastifyPluginAsync
+```
+
+```ts
+import Fastify from "fastify";
+import { fastifyRateLimit } from "throttlekit/fastify";
+import { gcra } from "throttlekit";
+
+const app = Fastify();
+await app.register(fastifyRateLimit, {
+  strategy: gcra({ limit: 200, periodMs: 60_000 }),
+});
+```
+
+---
+
+## throttlekit/koa
+
+```ts
+import { koaRateLimit } from "throttlekit/koa";
+```
+
+Returns a Koa middleware function `(ctx, next) => Promise<void>`.
+
+```ts
+function koaRateLimit(options: EnforceOptions & {
+  keyFn?: (ctx: Context) => string;
+}): Middleware
+```
+
+```ts
+import Koa from "koa";
+import { koaRateLimit } from "throttlekit/koa";
+import { fixedWindow } from "throttlekit";
+
+const app = new Koa();
+app.use(koaRateLimit({ strategy: fixedWindow({ limit: 50, windowMs: 10_000 }) }));
+```
+
+---
+
+## throttlekit/hono
+
+```ts
+import { honoRateLimit } from "throttlekit/hono";
+```
+
+Returns a Hono middleware `MiddlewareHandler`.
+
+```ts
+function honoRateLimit(options: EnforceOptions & {
+  keyFn?: (c: Context) => string;
+}): MiddlewareHandler
+```
+
+```ts
+import { Hono } from "hono";
+import { honoRateLimit } from "throttlekit/hono";
+import { gcra } from "throttlekit";
+
+const app = new Hono();
+app.use("*", honoRateLimit({ strategy: gcra({ limit: 60, periodMs: 60_000 }) }));
+```
+
+---
+
+## throttlekit/fetch
+
+```ts
+import { withRateLimit } from "throttlekit/fetch";
+```
+
+Wraps a Web-standard `fetch` handler with rate limiting.
+
+```ts
+function withRateLimit(
+  handler: (request: Request) => Response | Promise<Response>,
+  options: EnforceOptions & {
+    keyFn?: (request: Request) => string;
+  }
+): (request: Request) => Promise<Response>
+```
+
+```ts
+import { withRateLimit } from "throttlekit/fetch";
+import { gcra } from "throttlekit";
+
+export default withRateLimit(
+  async (req) => new Response("OK"),
+  { strategy: gcra({ limit: 30, periodMs: 10_000 }) }
+);
+```
+
+---
+
+## throttlekit/next
+
+```ts
+import { nextRateLimit } from "throttlekit/next";
+```
+
+Returns a Next.js App Router middleware or Pages API route wrapper.
+
+```ts
+function nextRateLimit(options: EnforceOptions & {
+  keyFn?: (request: NextRequest) => string;
+}): (request: NextRequest) => Promise<NextResponse>
+```
+
+```ts
+// middleware.ts
+import { nextRateLimit } from "throttlekit/next";
+import { gcra } from "throttlekit";
+
+export const middleware = nextRateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+});
+
+export const config = { matcher: "/api/:path*" };
+```
+
+---
+
+## throttlekit/nest
+
+```ts
+import { nestRateLimit } from "throttlekit/nest";
+```
+
+Returns a NestJS `NestInterceptor` or guard compatible with `@UseInterceptors()`.
+
+```ts
+function nestRateLimit(options: EnforceOptions & {
+  keyFn?: (context: ExecutionContext) => string;
+}): NestInterceptor
+```
+
+```ts
+import { Controller, Get, UseInterceptors } from "@nestjs/common";
+import { nestRateLimit } from "throttlekit/nest";
+import { gcra } from "throttlekit";
+
+@UseInterceptors(nestRateLimit({ strategy: gcra({ limit: 50, periodMs: 60_000 }) }))
+@Controller("api")
+export class ApiController {
+  @Get()
+  handle() { return "ok"; }
+}
+```
+
+---
+
+## throttlekit/sveltekit
+
+```ts
+import { sveltekitRateLimit } from "throttlekit/sveltekit";
+```
+
+Returns a SvelteKit `Handle` hook.
+
+```ts
+function sveltekitRateLimit(options: EnforceOptions & {
+  keyFn?: (event: RequestEvent) => string;
+}): Handle
+```
+
+```ts
+// hooks.server.ts
+import { sveltekitRateLimit } from "throttlekit/sveltekit";
+import { gcra } from "throttlekit";
+
+export const handle = sveltekitRateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+});
+```
+
+---
+
+## throttlekit/remix
+
+```ts
+import { remixRateLimit } from "throttlekit/remix";
+```
+
+Returns a Remix loader/action wrapper.
+
+```ts
+function remixRateLimit(options: EnforceOptions & {
+  keyFn?: (request: Request) => string;
+}): <T>(handler: LoaderFunction | ActionFunction) => LoaderFunction | ActionFunction
+```
+
+```ts
+import { remixRateLimit } from "throttlekit/remix";
+import { gcra } from "throttlekit";
+
+const withLimit = remixRateLimit({ strategy: gcra({ limit: 60, periodMs: 60_000 }) });
+
+export const loader = withLimit(async ({ request }) => {
+  return json({ ok: true });
+});
+```
+
+---
+
+## throttlekit/elysia
+
+```ts
+import { elysiaRateLimit } from "throttlekit/elysia";
+```
+
+Returns an Elysia plugin.
+
+```ts
+function elysiaRateLimit(options: EnforceOptions & {
+  keyFn?: (context: Context) => string;
+}): Elysia
+```
+
+```ts
+import { Elysia } from "elysia";
+import { elysiaRateLimit } from "throttlekit/elysia";
+import { gcra } from "throttlekit";
+
+const app = new Elysia()
+  .use(elysiaRateLimit({ strategy: gcra({ limit: 100, periodMs: 60_000 }) }))
+  .get("/", () => "OK");
+```
+
+---
+
+## throttlekit/trpc
+
+```ts
+import { trpcRateLimit } from "throttlekit/trpc";
+```
+
+Returns a tRPC middleware for use with `t.middleware()`.
+
+```ts
+function trpcRateLimit(options: EnforceOptions & {
+  keyFn?: (opts: MiddlewareOptions) => string;
+}): MiddlewareFunction
+```
+
+```ts
+import { initTRPC } from "@trpc/server";
+import { trpcRateLimit } from "throttlekit/trpc";
+import { gcra } from "throttlekit";
+
+const t = initTRPC.create();
+const rateLimited = t.middleware(
+  trpcRateLimit({ strategy: gcra({ limit: 30, periodMs: 60_000 }) })
+);
+
+const rateLimitedProcedure = t.procedure.use(rateLimited);
+```
+
+---
+
+## throttlekit/grpc
+
+```ts
+import { grpcRateLimit } from "throttlekit/grpc";
+```
+
+Returns a gRPC `ServerInterceptor`.
+
+```ts
+function grpcRateLimit(options: EnforceOptions & {
+  keyFn?: (call: ServerUnaryCall<unknown, unknown>) => string;
+}): ServerInterceptor
+```
+
+```ts
+import * as grpc from "@grpc/grpc-js";
+import { grpcRateLimit } from "throttlekit/grpc";
+import { gcra } from "throttlekit";
+
+const server = new grpc.Server({
+  interceptors: [grpcRateLimit({ strategy: gcra({ limit: 200, periodMs: 60_000 }) })],
+});
+```
+
+---
+
+## throttlekit/lambda
+
+```ts
+import { lambdaRateLimit } from "throttlekit/lambda";
+```
+
+Wraps an AWS Lambda handler with rate limiting. Works with API Gateway v1/v2 events.
+
+```ts
+function lambdaRateLimit(
+  handler: APIGatewayProxyHandler | APIGatewayProxyHandlerV2,
+  options: EnforceOptions & {
+    keyFn?: (event: APIGatewayProxyEvent | APIGatewayProxyEventV2) => string;
+  }
+): APIGatewayProxyHandler | APIGatewayProxyHandlerV2
+```
+
+```ts
+import { lambdaRateLimit } from "throttlekit/lambda";
+import { gcra } from "throttlekit";
+
+export const handler = lambdaRateLimit(
+  async (event) => ({ statusCode: 200, body: "OK" }),
+  { strategy: gcra({ limit: 50, periodMs: 60_000 }) }
+);
+```

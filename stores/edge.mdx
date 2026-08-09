@@ -1,0 +1,262 @@
+---
+title: "Edge Stores"
+sidebarTitle: "Edge Stores"
+description: "Rate limiting on Cloudflare Workers and Deno Deploy — Durable Objects, D1 SQLite, Workers KV, and Deno KV, each with the right atomicity primitive."
+---
+
+ThrottleKit ships four edge-runtime stores covering the two major serverless platforms. Each store is matched to the strongest atomic primitive its runtime actually offers, so you get exact counting (or an honest approximation) without importing Redis or Postgres into a Worker.
+
+| Store | Import | Runtime | Atomicity | Exact? |
+|---|---|---|---|---|
+| `DurableObjectStore` | `throttlekit/cloudflare` | Cloudflare Workers | `blockConcurrencyWhile` | ✅ |
+| `D1Store` | `throttlekit/cloudflare` | Cloudflare Workers | Version CAS via conditional `UPDATE` | ✅ |
+| `KVStore` | `throttlekit/cloudflare` | Cloudflare Workers | None — last-write-wins | ⚠️ approximate |
+| `DenoKvStore` | `throttlekit/deno` | Deno Deploy | `atomic().check(versionstamp).commit()` | ✅ |
+
+---
+
+## Cloudflare
+
+### Durable Object Store
+
+`DurableObjectStore` is the **recommended** Cloudflare backend. A Durable Object is a single-threaded actor with strongly-consistent transactional storage. The store wraps the rate-limit transform inside `blockConcurrencyWhile`, which serializes it against every other event handler in the object — making the read-modify-write atomic with **no optimistic-retry loop**. N concurrent increments from any number of Workers land exactly N.
+
+**Where it runs.** Construct the store *inside* your Durable Object class, from the object's `state`:
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+import { DurableObjectStore } from "throttlekit/cloudflare";
+
+export class RateLimiter {
+  private limiter;
+
+  constructor(state: DurableObjectState) {
+    this.limiter = rateLimit({
+      strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+      store: new DurableObjectStore(state),
+    });
+  }
+
+  async fetch(req: Request): Promise<Response> {
+    const key = new URL(req.url).pathname.slice(1) || "default";
+    const d = await this.limiter.check(key);
+    return Response.json(d, { status: d.allowed ? 200 : 429 });
+  }
+}
+```
+
+**Sharding.** Each DO instance is one serialization point. To enforce independent per-identity limits, route each rate-limit key to its own DO via `env.NS.idFromName(key)`. To enforce a shared global budget, route a bounded key set through a single object.
+
+#### `DurableObjectStore` options
+
+<ParamField path="state" type="DurableObjectStateLike" required>
+  The Durable Object's `state` (passed to your object's constructor). ThrottleKit
+  uses `state.storage` for persistence and `state.blockConcurrencyWhile` for
+  atomicity. A real `DurableObjectState` satisfies this structurally — no
+  `@cloudflare/workers-types` dependency required.
+</ParamField>
+
+<ParamField path="options.prefix" type="string">
+  Storage key namespace. Keys are stored as `prefix:key`. Useful when one
+  Durable Object instance backs multiple limiters.
+</ParamField>
+
+<ParamField path="options.clock" type="Clock">
+  Time source for lazy expiry. Defaults to the system clock. Inject a
+  `ManualClock` for deterministic tests.
+</ParamField>
+
+---
+
+### D1 Store
+
+`D1Store` is the right backend when you have a **D1 binding** in your Worker but are not using a Durable Object. D1 is edge SQLite backed by Cloudflare's global network. The store uses **optimistic concurrency** — a version compare-and-set via `UPDATE … WHERE key = ? AND version = ?` — and coalesces same-isolate applies into a single clean version bump to avoid self-contention.
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+import { D1Store } from "throttlekit/cloudflare";
+
+// Cloudflare Workers fetch handler
+export default {
+  async fetch(req: Request, env: { DB: D1Database }): Promise<Response> {
+    const store = new D1Store({ db: env.DB });
+
+    const limiter = rateLimit({
+      strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+      store,
+    });
+
+    const key = new URL(req.url).hostname;
+    const d = await limiter.check(key);
+    return Response.json(d, { status: d.allowed ? 200 : 429 });
+  },
+};
+```
+
+**Schema.** When `autoCreate: true` (default), the table and index are created on first use:
+
+```sql
+CREATE TABLE IF NOT EXISTS throttlekit (
+  key        TEXT    PRIMARY KEY,
+  state      TEXT    NOT NULL,
+  expires_at INTEGER NOT NULL,
+  version    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS throttlekit_expires_idx ON throttlekit (expires_at);
+```
+
+**Expiry sweep.** Workers are ephemeral — there is no background sweep timer. Call `store.sweep()` from a [Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/) to delete expired rows and reclaim space. Lazy expiry keeps every read correct without it.
+
+#### `D1Store` options
+
+<ParamField path="db" type="D1Like" required>
+  A Cloudflare `D1Database` binding (e.g. `env.DB`). ThrottleKit never closes
+  a binding it is given.
+</ParamField>
+
+<ParamField path="table" type="string" default='"throttlekit"'>
+  Table name. Validated against `^[A-Za-z_][A-Za-z0-9_]*$` since identifiers
+  cannot be parameterized.
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Storage key namespace (`prefix:key`).
+</ParamField>
+
+<ParamField path="autoCreate" type="boolean" default="true">
+  Create the table and index on first use. Set `false` when you manage the
+  schema via Wrangler D1 migrations.
+</ParamField>
+
+<ParamField path="maxRetries" type="number" default="16">
+  Bounded retries for the version CAS. In-process applies are already
+  coalesced, so retries are spent only on genuine cross-isolate races.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Time source for lazy expiry. Defaults to the system clock.
+</ParamField>
+
+---
+
+### Workers KV Store
+
+<Warning>
+  `KVStore` is **best-effort and approximate**. Workers KV is eventually
+  consistent with no atomic compare-and-set, so concurrent checks can
+  read-modify-write over each other (lost updates) and a write may not be
+  visible to another edge location for several seconds. It can **over-admit**
+  under load. Use it only where occasional over-admission is acceptable — coarse,
+  cheap edge protection. For correctness on Cloudflare, use `DurableObjectStore`
+  or `D1Store`.
+</Warning>
+
+`KVStore` provides a lightweight, global-CDN-backed rate-limit layer for cases where exact counting is not required and you have no DO or D1 binding. A logical epoch-ms expiry is stored alongside the state to keep window math correct on the reading side; however, KV's 60-second minimum `expirationTtl` means idle keys physically linger up to one minute.
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+import { KVStore } from "throttlekit/cloudflare";
+
+export default {
+  async fetch(req: Request, env: { RATELIMIT: KVNamespace }): Promise<Response> {
+    const store = new KVStore({ kv: env.RATELIMIT, prefix: "rl" });
+
+    const limiter = rateLimit({
+      strategy: gcra({ limit: 100, periodMs: 60_000 }),
+      store,
+    });
+
+    const ip = req.headers.get("cf-connecting-ip") ?? "anon";
+    const d = await limiter.check(ip);
+    return Response.json(d, { status: d.allowed ? 200 : 429 });
+  },
+};
+```
+
+#### `KVStore` options
+
+<ParamField path="kv" type="KVNamespaceLike" required>
+  The bound KV namespace (e.g. `env.RATELIMIT`).
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Key namespace so one KV namespace can back multiple limiters.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Time source for the logical expiry check. Defaults to the system clock.
+</ParamField>
+
+---
+
+## Deno KV Store
+
+`DenoKvStore` is the exact distributed backend for **Deno Deploy**. Deno KV provides a first-class atomic transaction primitive — `kv.atomic().check(versionstamp).commit()` — so the compare-and-set is built on native platform semantics rather than a hand-rolled version column. The `check` asserts the key is still at the versionstamp we read; if another isolate wrote between our read and our write the commit fails (`ok: false`) and we re-read and retry.
+
+In-process coalescing (a per-key promise chain, identical to the `DynamoStore` pattern) serializes same-isolate applies so CAS retries are spent only on genuine cross-isolate races.
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+import { DenoKvStore } from "throttlekit/deno";
+
+const kv = await Deno.openKv();
+
+const store = new DenoKvStore({ kv, prefix: "rl" });
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+  store,
+});
+
+// In a Deno.serve handler:
+Deno.serve(async (req) => {
+  const userId = req.headers.get("x-user-id") ?? "anon";
+  const d = await limiter.check(userId);
+  return Response.json(d, { status: d.allowed ? 200 : 429 });
+});
+```
+
+**Native TTL.** The `set` operation carries Deno KV's `expireIn` option so KV reclaims storage automatically. The entry also stores an epoch-ms expiry for lazy clock-injected expiry on reads — keeping decisions consistent with the Redis and Postgres backends and deterministic under a `ManualClock` in tests.
+
+#### `DenoKvStore` options
+
+<ParamField path="kv" type="DenoKvLike" required>
+  An open `Deno.Kv` handle (from `await Deno.openKv()`). ThrottleKit never
+  closes a handle it is given.
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Key-prefix part. Keys are stored as `[prefix, key]` (a two-element KV key
+  tuple), namespacing one KV store across multiple limiters.
+</ParamField>
+
+<ParamField path="maxRetries" type="number" default="16">
+  Bounded retries for the versionstamp CAS. In-process applies are coalesced,
+  so retries are spent only on genuine cross-isolate races.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Time source for lazy expiry. Defaults to the system clock. Inject a
+  `ManualClock` for deterministic tests.
+</ParamField>
+
+---
+
+## Choosing a Cloudflare backend
+
+| I have… | Best choice |
+|---|---|
+| A Durable Object for each identity | `DurableObjectStore` — no retry loop, lowest latency |
+| A D1 binding in my Worker | `D1Store` — exact, version-CAS, edge SQLite |
+| Only Workers KV, coarse protection is fine | `KVStore` — approximate, but simple and global |
+
+<Note>
+  All edge stores are **async-only**. `limiter.checkSync(key)` throws at
+  runtime — always use `await limiter.check(key)`.
+</Note>
+
+## Failure behavior
+
+- **`DurableObjectStore`**: the RMW runs inside the Durable Object — there is no external network hop in the critical section and no retry loop. A DO relocation carries its storage, so there is no data loss.
+- **`D1Store`** and **`DenoKvStore`**: if the CAS retries are exhausted under extreme cross-isolate contention, a `StoreUnavailableError` is thrown. The limiter's `fail` policy (`"open"` or `"closed"`) controls what that means for your application.
+- **`KVStore`**: can over-admit under concurrent load — by design. There is no error on concurrent writes; the last write wins.

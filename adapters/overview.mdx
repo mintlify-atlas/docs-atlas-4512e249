@@ -1,0 +1,221 @@
+---
+title: "Adapters Overview"
+sidebarTitle: "Overview"
+description: "ThrottleKit ships 13 framework adapters — thin glue over one enforcement core — all sharing the same options surface and standards headers."
+---
+
+Every ThrottleKit adapter is thin glue. Each one resolves a `Limiter`, derives a limit key from the incoming request, runs the shared enforcement core, and maps the result onto whatever response shape the framework expects — a `RequestHandler`, a `CanActivate` guard, a thrown `Response`, a gRPC callback. The options surface (`key`, `cost`, `fail`, `emit`, `onLimited`, `onError`, `handler`) is identical across all 13 adapters, so switching frameworks changes the import path, not the policy.
+
+## All adapters
+
+| Name | Import subpath | Framework | Notes |
+|---|---|---|---|
+| `expressRateLimit` | `throttlekit/express` | Express | `RequestHandler` middleware |
+| `fastifyRateLimit` | `throttlekit/fastify` | Fastify v5 | `onRequest` hook |
+| `koaRateLimit` | `throttlekit/koa` | Koa v3 | `Middleware` |
+| `honoRateLimit` | `throttlekit/hono` | Hono v4 | `MiddlewareHandler` |
+| `nextRateLimit` | `throttlekit/next` | Next.js | Returns `{limited, headers\|response}` — no `"next"` import |
+| `nestRateLimit` | `throttlekit/nest` | NestJS | `CanActivate` guard; `@RateLimit` decorator pattern |
+| `sveltekitRateLimit` | `throttlekit/sveltekit` | SvelteKit | `handle` hook for `hooks.server.ts` |
+| `remixRateLimit` | `throttlekit/remix` | Remix / React Router | Guard — throws a `Response` on deny |
+| `elysiaRateLimit` | `throttlekit/elysia` | Elysia | `onBeforeHandle` hook |
+| `withRateLimit` | `throttlekit/fetch` | Web `fetch` | Cloudflare Workers · Deno · Bun · Next.js edge |
+| `trpcRateLimit` | `throttlekit/trpc` | tRPC | `t.middleware(...)` |
+| `grpcRateLimit` | `throttlekit/grpc` | gRPC (grpc-js) | Built on `createEnforcer`; `RESOURCE_EXHAUSTED` on deny |
+| `lambdaRateLimit` | `throttlekit/lambda` | AWS Lambda | API Gateway v1 + v2; built on `createEnforcer` |
+
+---
+
+## Shared options
+
+All HTTP adapters accept `CommonAdapterOptions`. The most commonly used fields are:
+
+<ParamField body="strategy" type="Strategy" required>
+  The algorithm that produces decisions — `gcra(...)`, `fixedWindow(...)`, `tokenBucket(...)`, etc. Alternatively pass a prebuilt `{ limiter }`.
+</ParamField>
+
+<ParamField body="key" type="(req) => string">
+  Derive the limit key from a request. Defaults to a proxy-correct client IP. Override with an API token, user ID, or any string that identifies the requester.
+</ParamField>
+
+<ParamField body="cost" type="number | (req) => number">
+  Units to deduct per request. Default `1`. Pass a function to charge writes more than reads, or to meter by payload size.
+</ParamField>
+
+<ParamField body="fail" type='"open" | "closed"'>
+  What to do when the backing store is unreachable. `"open"` admits the request (availability-first, the default). `"closed"` rejects with `503` (safety-first — use for auth, payments, or sign-up flows).
+</ParamField>
+
+<ParamField body="emit" type="HeaderEmit">
+  Which header families to write. Default `{ draft: true }`. Accepts `{ draft, structured, legacy }` — see [Standards headers](#standards-headers) below.
+</ParamField>
+
+<ParamField body="policyName" type="string">
+  Name surfaced inside structured-field headers. Defaults to the strategy name (e.g. `"gcra"`).
+</ParamField>
+
+<ParamField body="trustProxy" type="number">
+  Number of trusted reverse-proxy hops when reading `X-Forwarded-For`. `0` (default) trusts no proxies; set to `1` behind a single load balancer.
+</ParamField>
+
+<ParamField body="ipv6Prefix" type="number">
+  Aggregate IPv6 addresses to this prefix length (e.g. `64` buckets a `/64` subnet together). Prevents trivial key rotation by cycling addresses.
+</ParamField>
+
+<ParamField body="onLimited" type="(req, res, decision) => void">
+  Observability hook fired on every denial, before the response is written. Use it to emit metrics or structured logs.
+</ParamField>
+
+<ParamField body="onError" type="(req, res, err) => void">
+  Observability hook fired when the backing store throws, before the `fail` policy is applied.
+</ParamField>
+
+<ParamField body="handler" type="(req, res, decision) => void | Response">
+  Custom `429` responder. When provided, it fully owns the denial response — the adapter will not write its default `429` body.
+</ParamField>
+
+---
+
+## Standards headers
+
+### `buildRateLimitHeaders()`
+
+```ts
+import { buildRateLimitHeaders } from "throttlekit/headers";
+
+const headers = buildRateLimitHeaders(decision, {
+  emit: { draft: true, legacy: true },
+  policyName: "api",
+  now: Date.now(),          // optional — defaults to system clock
+  windowSeconds: 60,        // optional — surfaced in structured RateLimit-Policy
+});
+```
+
+`buildRateLimitHeaders` accepts a `Decision` and an optional options object and returns a `Record<string, string>` ready to set on any response. ThrottleKit supports three header families, controlled by the `emit` option:
+
+| Family | Headers emitted | Reset value |
+|---|---|---|
+| `draft` (default) | `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` | Delta-seconds until replenishment |
+| `structured` | `RateLimit`, `RateLimit-Policy` (RFC 9651 Structured Fields, draft-11) | Delta-seconds |
+| `legacy` | `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` | Absolute epoch-seconds |
+
+On a denial (`decision.allowed === false`) a `Retry-After` header (delta-seconds, rounded up, minimum 1) is **always** added regardless of the `emit` selection.
+
+---
+
+## `createEnforcer()` — custom and non-HTTP transports
+
+For protocols that are not HTTP — message queues, job runners, WebSocket frames, gRPC, or any custom transport — use `createEnforcer` instead of an HTTP adapter. It exposes the same enforcement logic but returns a transport-neutral `EnforceResult` rather than writing a response.
+
+```ts
+import { createEnforcer } from "throttlekit/enforce";
+import { gcra } from "throttlekit";
+
+const { enforce } = createEnforcer({
+  strategy: gcra({ limit: 30, periodMs: 10_000 }),
+  fail: "open",
+  onLimited: (key, decision) => console.warn("limited", key, decision.retryAfterMs),
+});
+
+const result = await enforce(clientKey, cost);
+// result.outcome: "ok" | "limited" | "error"
+// result.allowed: boolean
+// result.headers: Record<string, string>
+// result.retryAfterMs: number
+```
+
+### `Enforcer` interface
+
+```ts
+interface Enforcer {
+  readonly limiter: Limiter;
+  readonly fail: FailMode;
+  enforce(key: string, cost?: number): Promise<EnforceResult>;
+}
+```
+
+### `EnforceResult` fields
+
+<ParamField body="allowed" type="boolean">
+  Whether to admit the request. `true` for outcome `"ok"`, and also for `"error"` under a fail-open policy; `false` for `"limited"` and for `"error"` under fail-closed.
+</ParamField>
+
+<ParamField body="outcome" type='"ok" | "limited" | "error"'>
+  Which branch produced this result. Use this to distinguish a `429` (`"limited"`) from a `503` (`"error"`).
+</ParamField>
+
+<ParamField body="decision" type="Decision | undefined">
+  The rate-limit decision, or `undefined` when the store threw (`outcome === "error"`).
+</ParamField>
+
+<ParamField body="headers" type="Record<string, string>">
+  Standards-compliant response headers. Empty on `"error"` or when `emit` is `false`.
+</ParamField>
+
+<ParamField body="retryAfterMs" type="number">
+  Milliseconds until the limit resets. `0` unless `outcome` is `"limited"`.
+</ParamField>
+
+### `EnforceOptions`
+
+<ParamField body="strategy" type="Strategy" required>
+  The rate-limiting strategy (or a prebuilt `{ limiter }`).
+</ParamField>
+
+<ParamField body="fail" type='"open" | "closed"'>
+  Store-outage behavior. Default `"open"`.
+</ParamField>
+
+<ParamField body="emit" type="HeaderEmit | false">
+  Header families to include in `result.headers`. Default `{ draft: true }`. Pass `false` to suppress all headers.
+</ParamField>
+
+<ParamField body="policyName" type="string">
+  Name for structured-field headers.
+</ParamField>
+
+<ParamField body="onLimited" type="(key: string, decision: Decision) => void">
+  Fired on every denial.
+</ParamField>
+
+<ParamField body="onError" type="(key: string, err: unknown) => void">
+  Fired when the store throws, before the fail policy is applied.
+</ParamField>
+
+---
+
+## Security helpers
+
+### `clientIp()` / `edgeClientIp()`
+
+Node adapters call `nodeClientIp(req, trust)` (reads socket peer + `X-Forwarded-For` through the configured trust chain). Edge adapters call `edgeClientIp(request, trust, trustClientIpHeader)` which trusts the platform header (`cf-connecting-ip`) first and only falls back to `X-Forwarded-For` when `trustProxy` is configured — returning `"anon"` rather than a spoofable key when no trusted source is present. Key derivation is a security control: a spoofable key lets a client bypass the limit by rotating addresses.
+
+### `hashKey()`
+
+Pass any key through a one-way hash before storing it in the rate-limit store. Avoids holding raw IP addresses or user IDs (PII) in Redis.
+
+```ts
+import { hashKey } from "throttlekit";
+
+const key = hashKey(rawIp); // SHA-256 hex, truncated to 32 chars
+```
+
+### `hmacKeyer()`
+
+Build a keyed HMAC function once and use it as the `key` option. The secret prevents offline dictionary attacks against the store.
+
+```ts
+import { hmacKeyer } from "throttlekit";
+
+const keyer = hmacKeyer(process.env.RL_SECRET ?? "dev-secret");
+
+// In your adapter options:
+key: (req) => keyer(req.ip ?? "anon"),
+```
+
+---
+
+## Next steps
+
+- **Node frameworks** (Express, Fastify, Koa, Hono, Next.js, NestJS, tRPC, gRPC) → [Node Frameworks](/adapters/node-frameworks)
+- **Edge & serverless** (Web fetch, SvelteKit, Remix, Elysia, AWS Lambda) → [Edge & Serverless](/adapters/edge-serverless)

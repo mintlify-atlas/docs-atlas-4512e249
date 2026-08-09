@@ -1,0 +1,568 @@
+---
+title: "Node Framework Adapters"
+sidebarTitle: "Node Frameworks"
+description: "Rate-limit Express, Fastify, Koa, Hono, Next.js, NestJS, tRPC, and gRPC with one shared options surface and automatic standards headers."
+---
+
+ThrottleKit ships a first-class adapter for every major Node framework. Each adapter is a thin binding over the same enforcement core: it resolves a `Limiter`, extracts a limit key from the request (proxy-correct client IP by default), runs the check, writes standards headers onto the response, and either calls `next()` or short-circuits with a `429` — no shared state, no global singleton, no framework-level install step.
+
+---
+
+## Express
+
+Import from `throttlekit/express`. `expressRateLimit` returns a standard `RequestHandler` you pass to `app.use(...)` or to any individual route.
+
+```ts
+import { expressRateLimit } from "throttlekit/express";
+```
+
+**Signature**
+
+```ts
+function expressRateLimit(options: ExpressRateLimitOptions): RequestHandler
+```
+
+**Key options** (`ExpressRateLimitOptions` extends `CommonAdapterOptions`):
+
+<ParamField body="strategy" type="Strategy" required>
+  The algorithm — `gcra(...)`, `fixedWindow(...)`, `tokenBucket(...)`, etc. Alternatively pass a prebuilt `{ limiter }`.
+</ParamField>
+
+<ParamField body="key" type="(req: Request) => string">
+  Derive the limit key from the Express request. Default: proxy-correct, aggregated client IP.
+</ParamField>
+
+<ParamField body="cost" type="number | (req: Request) => number">
+  Units to deduct per request. Default `1`. The function form lets you charge writes more than reads.
+</ParamField>
+
+<ParamField body="fail" type='"open" | "closed"'>
+  Store-outage behavior. `"open"` passes the request through (default); `"closed"` responds `503`.
+</ParamField>
+
+<ParamField body="onLimited" type="(req, res, decision) => void">
+  Observability hook fired on every `429` denial, before the response is written.
+</ParamField>
+
+<ParamField body="handler" type="(req, res, decision) => void">
+  Custom denial responder. When provided it fully owns the `429` response body.
+</ParamField>
+
+**Example**
+
+```ts
+import express, { type Request } from "express";
+import { expressRateLimit } from "throttlekit/express";
+import { gcra, hmacKeyer } from "throttlekit";
+
+const app = express();
+
+// Hash the limit key so a shared store never holds the raw identifier (PII-safe).
+const keyer = hmacKeyer(process.env.RL_SECRET ?? "dev-secret");
+
+// Pull an API key from the header when present, else fall back to the client IP.
+function keyFor(req: Request): string {
+  const apiKey = req.headers["x-api-key"];
+  const raw = (Array.isArray(apiKey) ? apiKey[0] : apiKey) ?? req.ip ?? "anon";
+  return keyer(raw);
+}
+
+app.use(
+  expressRateLimit({
+    strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+    key: keyFor,
+    // Writes cost more than reads.
+    cost: (req) => (req.method === "POST" ? 5 : 1),
+    fail: "open",
+    emit: { draft: true, legacy: true }, // IETF draft + legacy X-RateLimit-* headers
+    // Behind a load balancer, trust one proxy hop so the client IP isn't the balancer's.
+    trustProxy: 1,
+    ipv6Prefix: 64,
+    onLimited: (req, _res, d) => {
+      console.warn("rate limited", req.method, req.path, "retryAfterMs:", d.retryAfterMs);
+    },
+  }),
+);
+
+app.get("/", (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.listen(3000);
+```
+
+---
+
+## Fastify
+
+Import from `throttlekit/fastify`. `fastifyRateLimit` returns an async `onRequest` hook you register with `fastify.addHook(...)`. Sending a terminal reply inside an `onRequest` hook short-circuits the lifecycle so denials never reach the route handler.
+
+<Tabs>
+  <Tab title="Rate limit">
+    ```ts
+    import Fastify from "fastify";
+    import { fastifyRateLimit } from "throttlekit/fastify";
+    import { gcra } from "throttlekit";
+
+    const fastify = Fastify();
+
+    fastify.addHook(
+      "onRequest",
+      fastifyRateLimit({
+        strategy: gcra({ limit: 100, periodMs: 60_000 }),
+        fail: "open",
+        emit: { draft: true },
+        onLimited: (request, _reply, d) =>
+          console.warn("limited", request.url, d.retryAfterMs),
+      }),
+    );
+
+    fastify.get("/", async () => ({ ok: true }));
+    await fastify.listen({ port: 3000 });
+    ```
+  </Tab>
+  <Tab title="Unified admission">
+    ```ts
+    import { fastifyUnifiedAdmission } from "throttlekit/fastify";
+    import { unifiedAdmission, gcra, adaptiveConcurrency } from "throttlekit";
+
+    const admitter = unifiedAdmission({
+      rate: gcra({ limit: 100, periodMs: 60_000 }),
+      concurrency: adaptiveConcurrency({ minLimit: 4, maxLimit: 128 }),
+    });
+
+    // Must be preHandler (not onRequest) so reply.raw has subscribers.
+    fastify.addHook("preHandler", fastifyUnifiedAdmission({ admitter }));
+    ```
+  </Tab>
+</Tabs>
+
+**Signature**
+
+```ts
+function fastifyRateLimit(
+  options: FastifyRateLimitOptions,
+): (request: FastifyRequest, reply: FastifyReply) => Promise<void>
+```
+
+The `key` option receives a `FastifyRequest`; `onLimited` and `handler` receive `(request, reply, decision)`.
+
+<Callout type="info">
+  Register the **unified admission** hook as `preHandler`, not `onRequest`. The `onRequest` hook runs before the routing layer attaches handlers to `reply.raw`, so the response stream has no subscribers yet and `release()` would never fire.
+</Callout>
+
+---
+
+## Koa
+
+Import from `throttlekit/koa`. `koaRateLimit` returns a standard Koa `Middleware`.
+
+```ts
+import Koa from "koa";
+import { koaRateLimit } from "throttlekit/koa";
+import { gcra } from "throttlekit";
+
+const app = new Koa();
+
+app.use(
+  koaRateLimit({
+    strategy: gcra({ limit: 100, periodMs: 60_000 }),
+    key: (ctx) => ctx.ip,
+    fail: "open",
+    emit: { draft: true },
+    onLimited: (ctx, d) =>
+      console.warn("limited", ctx.path, d.retryAfterMs),
+  }),
+);
+
+app.use((ctx) => {
+  ctx.body = { ok: true };
+});
+
+app.listen(3000);
+```
+
+**Signature**
+
+```ts
+function koaRateLimit(options: KoaRateLimitOptions): Middleware
+```
+
+The `key` option receives a Koa `Context`. The default key reads `ctx.req` (the Node `IncomingMessage`) directly, so it is correct regardless of Koa's `app.proxy` setting.
+
+---
+
+## Hono
+
+Import from `throttlekit/hono`. `honoRateLimit` returns a `MiddlewareHandler` for Hono v4.
+
+```ts
+import { Hono } from "hono";
+import { honoRateLimit } from "throttlekit/hono";
+import { gcra } from "throttlekit";
+
+const app = new Hono();
+
+// Gate every route. Default key: cf-connecting-ip → x-forwarded-for → "anon".
+app.use(
+  "*",
+  honoRateLimit({
+    strategy: gcra({ limit: 3, periodMs: 10_000 }),
+    fail: "open",
+    emit: { draft: true },
+    onLimited: (c, d) =>
+      console.warn("limited", c.req.path, "retryAfterMs:", d.retryAfterMs),
+  }),
+);
+
+app.get("/", (c) => c.json({ ok: true }));
+```
+
+**Smoke test** — fire 4 requests against a limit of 3:
+
+```ts
+for (let i = 1; i <= 4; i++) {
+  const res = await app.fetch(
+    new Request("https://example.com/", {
+      headers: { "cf-connecting-ip": "203.0.113.5" },
+    }),
+  );
+  console.log(
+    `#${i} status: ${res.status}`,
+    "remaining:", res.headers.get("RateLimit-Remaining"),
+    "retry-after:", res.headers.get("Retry-After") ?? "—",
+  );
+}
+// #1 status: 200  remaining: 2  retry-after: —
+// #2 status: 200  remaining: 1  retry-after: —
+// #3 status: 200  remaining: 0  retry-after: —
+// #4 status: 429  remaining: 0  retry-after: 10
+```
+
+**Signature**
+
+```ts
+function honoRateLimit(options: HonoRateLimitOptions): MiddlewareHandler
+```
+
+The `key` option receives a Hono `Context`. The default key uses `edgeClientIp` which trusts `cf-connecting-ip` first, then `x-forwarded-for` only if `trustProxy` is configured, otherwise returns `"anon"`.
+
+---
+
+## Next.js (API routes)
+
+Import from `throttlekit/next`. The adapter is **dependency-free** — it never imports `"next"`. `nextRateLimit` returns a function that accepts a `Request` and resolves to a `NextRateLimitResult` you branch on.
+
+```ts
+// middleware.ts
+import { NextResponse, type NextRequest } from "next/server";
+import { nextRateLimit } from "throttlekit/next";
+import { gcra } from "throttlekit";
+
+const limit = nextRateLimit({
+  strategy: gcra({ limit: 30, periodMs: 10_000 }),
+  fail: "open",
+});
+
+export async function middleware(req: NextRequest) {
+  const r = await limit(req);
+  if (r.limited) return r.response; // ready 429 (or 503 on fail-closed outage)
+  const res = NextResponse.next();
+  for (const [k, v] of Object.entries(r.headers)) {
+    res.headers.set(k, v);
+  }
+  return res;
+}
+
+export const config = { matcher: "/api/:path*" };
+```
+
+**Signature**
+
+```ts
+function nextRateLimit(
+  options: NextRateLimitOptions,
+): (request: Request) => Promise<NextRateLimitResult>
+
+type NextRateLimitResult =
+  | { limited: false; headers: Record<string, string> }  // apply to NextResponse.next()
+  | { limited: true;  response: Response }               // return directly
+```
+
+The `limited: true` branch carries a ready `Response` — either the `429` or a `503` on fail-closed outage — so your middleware stays a simple `if (r.limited) return r.response`.
+
+---
+
+## NestJS
+
+Import from `throttlekit/nest`. ThrottleKit provides two patterns:
+
+- **`nestRateLimit`** — a standalone `CanActivate` guard for decorating individual routes.
+- **`RateLimit` + `createRateLimitGuard`** — an idiomatic decorator + single globally-registered guard, mirroring the `@Throttle` + `ThrottlerGuard` pattern. No `@nestjs/common` import required.
+
+<Tabs>
+  <Tab title="Standalone guard">
+    ```ts
+    import { Controller, Post, UseGuards } from "@nestjs/common";
+    import { HttpException, HttpStatus } from "@nestjs/common";
+    import { nestRateLimit } from "throttlekit/nest";
+    import { gcra } from "throttlekit";
+
+    const RateLimitGuard = nestRateLimit({
+      strategy: gcra({ limit: 100, periodMs: 60_000 }),
+      // Return a real NestJS HttpException so the exception filter renders 429:
+      exceptionFactory: (d) =>
+        new HttpException(
+          { error: "Too Many Requests", retryAfterMs: d.retryAfterMs },
+          HttpStatus.TOO_MANY_REQUESTS,
+        ),
+    });
+
+    @Controller("posts")
+    export class PostsController {
+      @UseGuards(RateLimitGuard)
+      @Post()
+      create() {
+        return { ok: true };
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="@RateLimit decorator">
+    ```ts
+    // app.module.ts — register the guard once
+    import { Module } from "@nestjs/common";
+    import { APP_GUARD } from "@nestjs/core";
+    import { createRateLimitGuard } from "throttlekit/nest";
+    import { RedisStore } from "throttlekit/redis";
+
+    @Module({
+      providers: [
+        {
+          provide: APP_GUARD,
+          useValue: createRateLimitGuard({
+            store: new RedisStore({ client }),
+            exceptionFactory: (d) =>
+              new HttpException(
+                { error: "Too Many Requests", retryAfterMs: d.retryAfterMs },
+                HttpStatus.TOO_MANY_REQUESTS,
+              ),
+          }),
+        },
+      ],
+    })
+    export class AppModule {}
+
+    // any controller
+    import { RateLimit } from "throttlekit/nest";
+
+    @Controller("api")
+    export class ApiController {
+      @RateLimit({ limit: 100, period: "1m" })
+      @Post("resource")
+      create() {
+        return { ok: true };
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Unified middleware">
+    ```ts
+    // For adaptive-concurrency lifecycle, use Express-style middleware via MiddlewareConsumer
+    import type { MiddlewareConsumer, NestModule } from "@nestjs/common";
+    import { Module } from "@nestjs/common";
+    import { nestUnifiedAdmissionMiddleware } from "throttlekit/nest";
+    import { unifiedAdmission, gcra, adaptiveConcurrency } from "throttlekit";
+
+    const admitter = unifiedAdmission({
+      rate: gcra({ limit: 100, periodMs: 60_000 }),
+      concurrency: adaptiveConcurrency({ minLimit: 4, maxLimit: 128 }),
+    });
+
+    @Module({})
+    export class AppModule implements NestModule {
+      configure(consumer: MiddlewareConsumer) {
+        consumer
+          .apply(nestUnifiedAdmissionMiddleware({ admitter }))
+          .forRoutes("*");
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+**Key types**
+
+```ts
+function nestRateLimit(options: NestRateLimitOptions): NestCanActivate
+
+function createRateLimitGuard(options?: RateLimitGuardOptions): NestCanActivate
+
+function RateLimit(options: RateLimitMetadata): MethodDecorator & ClassDecorator
+```
+
+The `@RateLimit` decorator stamps reflect-metadata read by the globally-registered guard. One `Gate` is built and cached per distinct metadata object — so decorator configs are stable singletons, not rebuilt on every request. Routes without `@RateLimit` (and no `defaults`) pass through untouched.
+
+<Callout type="info">
+  Pass `exceptionFactory: (d) => new HttpException({...}, HttpStatus.TOO_MANY_REQUESTS)` to surface a proper `429` through NestJS's exception layer. Without it the guard throws a `RateLimitExceededError` which NestJS maps to `500` unless you add an exception filter.
+</Callout>
+
+---
+
+## tRPC
+
+Import from `throttlekit/trpc`. `trpcRateLimit` returns a middleware function you pass to `t.middleware(...)`. Because a tRPC `ctx` is application-defined, **`key` is required** — there is no default IP derivation.
+
+```ts
+import { TRPCError } from "@trpc/server";
+import { trpcRateLimit } from "throttlekit/trpc";
+import { gcra } from "throttlekit";
+
+const rateLimitMiddleware = trpcRateLimit<{ userId: string; ip: string }>({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  key: ({ ctx }) => ctx.userId ?? ctx.ip,
+  // Throw a real TRPCError so the client gets TOO_MANY_REQUESTS:
+  errorFactory: (d) =>
+    new TRPCError({
+      code: "TOO_MANY_REQUESTS",
+      message: `Rate limit exceeded; retry in ${d.retryAfterMs}ms`,
+    }),
+  onLimited: (ctx, d) =>
+    console.warn("limited", ctx.userId, "retryAfterMs:", d.retryAfterMs),
+});
+
+// Apply to a specific procedure:
+export const limitedProcedure = t.procedure.use(t.middleware(rateLimitMiddleware));
+
+// Use it:
+export const appRouter = router({
+  createPost: limitedProcedure.mutation(async ({ input }) => {
+    return await db.posts.create(input);
+  }),
+});
+```
+
+**Signature**
+
+```ts
+function trpcRateLimit<Ctx = unknown>(
+  options: TrpcRateLimitOptions<Ctx>,
+): TrpcRateLimitMiddleware<Ctx>
+
+type TrpcRateLimitMiddleware<Ctx> = <Result>(
+  params: TrpcMiddlewareParams<Ctx, Result>,
+) => Promise<Result>
+```
+
+<ParamField body="key" type="(meta: TrpcCallMeta<Ctx>) => string" required>
+  Derive the limit key. `meta` carries `{ ctx, path?, type? }`. Required because tRPC contexts are application-defined.
+</ParamField>
+
+<ParamField body="errorFactory" type="(decision: Decision) => unknown">
+  Build the error thrown on denial. Default: `RateLimitExceededError`. Pass a `TRPCError` factory for a proper `TOO_MANY_REQUESTS` code.
+</ParamField>
+
+tRPC headers are not HTTP, so the adapter does not emit `RateLimit-*` headers. Use `onLimited` for observability.
+
+---
+
+## gRPC
+
+Import from `throttlekit/grpc`. `grpcRateLimit` returns a gate with a `.unary(handler)` method. The gate is built on `createEnforcer` — no `@grpc/grpc-js` peer dependency required.
+
+```ts
+import { grpcRateLimit } from "throttlekit/grpc";
+import { gcra } from "throttlekit";
+
+const gate = grpcRateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  // Default key: call.getPeer() (the peer address string, e.g. "ipv4:203.0.113.7:54321")
+  // Override to read from call.metadata for token-based keying:
+  key: (call) => call.metadata?.get("x-api-key")?.[0]?.toString() ?? call.getPeer(),
+  fail: "open",
+});
+
+// Wrap each unary handler:
+server.addService(GreeterService, {
+  sayHello: gate.unary(sayHelloImpl),
+});
+```
+
+**Denial behavior**
+
+| Outcome | gRPC status |
+|---|---|
+| Over the limit | `RESOURCE_EXHAUSTED` (8) |
+| Store unreachable (`fail: "closed"`) | `UNAVAILABLE` (14) |
+| Store unreachable (`fail: "open"`) | Handler runs normally |
+
+**Signature**
+
+```ts
+function grpcRateLimit<Call extends GrpcServerCallLike>(
+  options: GrpcRateLimitOptions<Call>,
+): GrpcRateLimiter<Call>
+
+interface GrpcRateLimiter<Call> {
+  unary<Res>(handler: GrpcUnaryHandler<Call, Res>): GrpcUnaryHandler<Call, Res>;
+}
+```
+
+---
+
+## Key extraction and error handling
+
+### `keyExtractor` patterns
+
+Every Node adapter defaults to a proxy-correct client IP. The most common overrides are:
+
+```ts
+// API key header, falling back to IP:
+key: (req) => req.headers["x-api-key"] as string ?? req.ip ?? "anon",
+
+// Authenticated user ID (set by a prior auth middleware):
+key: (req) => (req as AuthedRequest).user.id,
+
+// HMAC the key before storing (PII-safe):
+key: (req) => hmacKeyer(process.env.RL_SECRET!)(req.ip ?? "anon"),
+```
+
+### 429 responses
+
+On denial, all HTTP adapters respond with:
+
+```json
+HTTP/1.1 429 Too Many Requests
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 42
+Retry-After: 42
+Content-Type: application/json
+
+{ "error": "Too Many Requests", "retryAfterMs": 42000 }
+```
+
+`Retry-After` is always delta-seconds, minimum 1, regardless of which header family (`emit`) is configured. To fully customize the response, pass a `handler` option:
+
+```ts
+expressRateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000 }),
+  handler: (req, res, decision) => {
+    res.status(429).json({
+      code: "RATE_LIMITED",
+      message: `Too many requests. Try again in ${decision.retryAfterMs}ms.`,
+    });
+  },
+});
+```
+
+### Fail-open vs fail-closed
+
+```ts
+// Fail-open (default) — availability-first: let the request through if the store is unreachable.
+expressRateLimit({ strategy: gcra({ limit: 100, periodMs: 60_000 }), fail: "open" });
+
+// Fail-closed — safety-first: respond 503 if the store is unreachable.
+// Use for auth, payments, sign-up, or any flow where unmetered traffic is dangerous.
+expressRateLimit({ strategy: gcra({ limit: 100, periodMs: 60_000 }), fail: "closed" });
+```

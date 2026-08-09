@@ -1,0 +1,230 @@
+---
+title: "CLI Reference"
+sidebarTitle: "CLI"
+description: "Three commands for benchmarking, environment diagnosis, and replaying decision logs — plus throttlekit-server for the gRPC service and Lens TUI."
+---
+
+ThrottleKit ships a zero-dependency CLI with three operator commands: `benchmark` for quick in-process performance measurement, `doctor` for environment and configuration checks, and `replay` for re-running a recorded traffic log against a limiter. All commands write to stdout/stderr and return standard UNIX exit codes (`0` = success, `1` = failure, `2` = usage error).
+
+```bash
+npx throttlekit --help
+```
+
+```
+throttlekit <command> [options]
+
+Commands:
+  benchmark                 Quick in-process micro-benchmark (gcra / tokenBucket / fixedWindow)
+  doctor                    Environment + optional-peer checks; validates .throttlekit.yaml if present
+  replay <log.jsonl>        Re-run a JSON-lines log of { key, cost? } through a configured limiter
+
+Common flags:
+  --help, -h                Show this help.
+  --version                 Print the throttlekit version.
+
+`replay` flags:
+  --config FILE             Load a .throttlekit.yaml / .json and select --name (default: "default")
+  --name NAME               Limiter name in the config
+  --strategy NAME           gcra | fixedWindow | tokenBucket   (when --config isn't used)
+  --limit N                 Limit / capacity                  (default 100)
+  --period DURATION         "1m" / "30s" / "1h" / ms          (default "1m")
+```
+
+---
+
+## `benchmark` — In-Process Micro-Benchmark
+
+Runs a tight loop against each of the three single-state strategies (GCRA, token bucket, fixed window) on an in-process `MemoryStore`, measuring ops/second and nanoseconds per operation.
+
+```bash
+npx throttlekit benchmark
+```
+
+Example output:
+
+```
+throttlekit benchmark — node v22.1.0, 2,000,000 iters / strategy
+  gcra        checkSync            4.21M ops/s      238 ns/op
+  tokenBucket checkSync            5.84M ops/s      171 ns/op
+  fixedWindow checkSync            6.91M ops/s      145 ns/op
+```
+
+The JIT is warmed up (up to 100,000 iterations) before the timed run begins, so the reported numbers reflect steady-state throughput.
+
+<Note>
+`benchmark` is strictly for orientation — it measures the in-process hot path with no store latency. Production performance depends on your store (Redis RTT, connection pool, etc.), key contention, and GC pressure. Use it to compare strategies, not to predict absolute throughput.
+</Note>
+
+---
+
+## `doctor` — Environment and Config Checks
+
+Checks Node.js version (≥ 18 required), probes optional peer dependencies, and validates your `.throttlekit.yaml` or `.throttlekit.json` if one is present in the current working directory.
+
+```bash
+npx throttlekit doctor
+```
+
+Example output:
+
+```
+throttlekit doctor — node v22.1.0
+  ✓ Node ≥ 18 (v22.1.0)
+  ✓ optional peer: ioredis
+  ◦ optional peer: redis (not installed — fine unless you use it)
+  ◦ optional peer: pg (not installed — fine unless you use it)
+  ◦ optional peer: @opentelemetry/api (not installed — fine unless you use it)
+  ◦ optional peer: @nestjs/common (not installed — fine unless you use it)
+  ✓ .throttlekit.yaml: 3 limiter(s) — api, webhook, admin
+
+All checks passed.
+```
+
+`doctor` exits `0` when all checks pass and `1` when at least one fails (Node < 18, or a YAML parse error).
+
+---
+
+## `replay` — Re-Run a Decision Log
+
+Reads a JSON-lines file where each line is `{ "key": string, "cost"?: number }`, replays every line through a limiter, and prints a summary of allow/deny counts plus the top-10 denied keys.
+
+```bash
+npx throttlekit replay requests.jsonl --config .throttlekit.yaml --name api
+```
+
+```
+replay: total=1420 allowed=980 denied=440 (30.9% deny rate)
+top denied keys:
+   312  203.0.113.47
+    88  203.0.113.12
+    40  198.51.100.7
+```
+
+### Specifying the Limiter
+
+**From a config file** (recommended for production):
+
+```bash
+npx throttlekit replay log.jsonl --config .throttlekit.yaml --name api
+```
+
+**Inline flags** (for quick experiments):
+
+```bash
+npx throttlekit replay log.jsonl --strategy gcra --limit 100 --period 1m
+```
+
+### `replay` Flags
+
+<ParamField path="--config FILE" type="string">
+  Path to a `.throttlekit.yaml` or `.throttlekit.json` config file. Use with `--name` to select a specific limiter.
+</ParamField>
+
+<ParamField path="--name NAME" type="string">
+  Name of the limiter to use from the config file. Defaults to `"default"`.
+</ParamField>
+
+<ParamField path="--strategy NAME" type="string">
+  Strategy to use when `--config` is not provided. One of `gcra` | `fixedWindow` | `tokenBucket`. Default `gcra`.
+</ParamField>
+
+<ParamField path="--limit N" type="number">
+  Limit / capacity for the inline strategy. Default `100`.
+</ParamField>
+
+<ParamField path="--period DURATION" type="string">
+  Period for the inline strategy. Accepts `"1m"`, `"30s"`, `"1h"`, or a raw millisecond count. Default `"1m"`.
+</ParamField>
+
+### Log Format
+
+Each line in the JSON-lines file must be a JSON object with at least a `key` field:
+
+```json
+{"key": "user-42"}
+{"key": "user-42", "cost": 5}
+{"key": "192.0.2.1"}
+```
+
+Lines that fail to parse as JSON, have a non-string `key`, or have a non-positive/non-finite `cost` are silently skipped (replay is a forensic tool — one dirty row shouldn't abort the run). Comment lines (starting with `#`) and blank lines are also skipped.
+
+---
+
+## `.throttlekit.yaml` Config Format
+
+The CLI (and `loadConfig`) reads a `.throttlekit.yaml` or `.throttlekit.json` with the following schema:
+
+```yaml
+limiters:
+  api:
+    strategy: gcra
+    limit: 100
+    period: 1m
+
+  webhook:
+    strategy: fixedWindow
+    limit: 50
+    windowMs: 60000
+
+  uploads:
+    strategy: tokenBucket
+    capacity: 200
+    refillPerSec: 10
+```
+
+Supported strategies in the config format: `gcra`, `fixedWindow`, `tokenBucket`.
+
+<Note>
+The built-in YAML parser is a **deliberately narrow, zero-dependency subset**: block maps, scalars, and inline flow maps (`{ k: v }`) only. It does not support block lists, anchors/aliases, multiline scalars, multi-document, or **nested flow maps** (e.g. `{ a: { b: 1 } }` throws a parse error). Any value with a nested sub-object must be written as an indented block. This narrow grammar has no YAML-bomb attack surface.
+</Note>
+
+### Loading the Config in Code
+
+```ts
+import { loadConfig } from "throttlekit/config";
+import { readFileSync } from "node:fs";
+
+const config = loadConfig(readFileSync(".throttlekit.yaml", "utf8"), {
+  store: redisStore, // inject the live store; it cannot be serialized into YAML
+});
+
+const limiter = config.limiters["api"];
+const decision = await limiter.check("user-42");
+```
+
+`loadConfig` auto-detects JSON (text starting with `{` or `[`) vs YAML. It builds independently-namespaced limiters — each limiter's key is prefixed with its policy name by default.
+
+---
+
+## `throttlekit-server` — gRPC Service with Lens TUI
+
+The `throttlekit-server` binary starts the gRPC rate-limit service. Two flags are relevant for operations:
+
+```bash
+throttlekit-server --config .throttlekit.yaml
+throttlekit-server --config .throttlekit.yaml --tui
+```
+
+<ParamField path="--config FILE" type="string" required>
+  Path to a `.throttlekit.yaml` or `.throttlekit.json` describing the limiters to serve.
+</ParamField>
+
+<ParamField path="--tui" type="boolean">
+  Launch the **ThrottleKit Lens** in-terminal dashboard. Renders live traffic stats, latency, fairness, capacity, and policy plan diffs across 8 tabbed views.
+</ParamField>
+
+Additional server flags (for Prometheus metrics and auth) are documented in the [Observability](/advanced/observability) and [Distributed Leasing](/advanced/distributed-leasing) pages.
+
+---
+
+<Accordion title="FAQ: How do I generate a replay log from production traffic?">
+Wire `tapDecisions` around your limiter and write each `DecisionEvent` as a JSON line to a file or log stream: `{ key: event.key, cost: event.cost }`. For long-running services, rotate the file daily and keep a rolling window. The `replay` command can then re-run any window against a candidate config.
+</Accordion>
+
+<Accordion title="FAQ: Can I use replay with a Redis-backed limiter?">
+Yes, via `--config`. `loadConfig` accepts an injected `store` argument, so you can pass a `RedisStore` at load time. However, for forensic replay you almost always want an in-memory store (the default when no `store` is injected) so the replay is deterministic and isolated from live production state.
+</Accordion>
+
+<Accordion title="FAQ: The doctor command reports a missing optional peer. Do I need to install it?">
+No. Optional peers are probed with a dynamic import and listed with `◦` (not `✗`) when absent. They are only needed if you use the corresponding feature: `ioredis` / `redis` for `RedisStore`, `pg` for `PostgresStore`, `@opentelemetry/api` for OTel instrumentation, and `@nestjs/common` for the NestJS adapter. If you don't use those features, the message is purely informational.
+</Accordion>

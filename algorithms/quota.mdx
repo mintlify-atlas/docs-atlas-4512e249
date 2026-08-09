@@ -1,0 +1,158 @@
+---
+title: "Quota"
+sidebarTitle: "Quota"
+description: "Billing-period budgets that reset on real calendar boundaries: calendar-month, -week, -day, fixed, or rolling — leap-year-correct by default."
+---
+
+The quota strategy implements first-class billing-period budgets — budgets that reset on a real calendar boundary rather than a sliding window. The motivating case is "1,000,000 API calls per month, resetting on the 1st": `Decision.remaining` is the budget left this period and `Decision.resetAt` is the **true** next civil boundary (the actual next 1st of the month, leap-year-correct), not an approximation.
+
+Unlike a sliding rate limit, a quota measures a finite allowance over a fixed period. When the period resets, the full budget is restored in a single step. This is the model that billing, metered SaaS, and per-tenant usage caps use.
+
+## Options
+
+<ParamField path="limit" type="number" required>
+  Units admitted per billing period. Once `limit` is consumed, all further requests in the period are denied without consuming anything. The counter resets to zero at the start of every new period.
+</ParamField>
+
+<ParamField path="resetCadence" type="QuotaCadence" required>
+  When the budget resets. See [Cadences](#cadences) for a full description of each value.
+</ParamField>
+
+<ParamField path="periodMs" type="number">
+  Period width in milliseconds. Required for `"fixed"` and `"rolling"` cadences. Ignored by calendar cadences (`"calendar-month"`, `"calendar-week"`, `"calendar-day"`).
+</ParamField>
+
+<ParamField path="anchor" type="number">
+  For `"fixed"` cadence only: epoch-ms anchor for window alignment. Fixed windows are aligned to `anchor + k * periodMs`. Default `0` (epoch-aligned, i.e., windows start at 1970-01-01 00:00:00 UTC offsets).
+</ParamField>
+
+<ParamField path="offsetMinutes" type="number">
+  Fixed UTC offset in minutes, applied to calendar cadences. For example, `330` for IST (UTC+5:30), `-300` for EST (UTC−5). Default `0` (UTC). Must be within ±840 (±14 hours). This is a **fixed offset, not a DST-aware zone** — see the note on leap-year correctness below.
+</ParamField>
+
+<ParamField path="weekStartsOn" type="number">
+  For `"calendar-week"` cadence: the weekday the week starts on. `0` = Sunday, `1` = Monday … `6` = Saturday. Default `1` (Monday).
+</ParamField>
+
+<ParamField path="buckets" type="number">
+  For `"rolling"` cadence only: the number of sub-buckets (accuracy vs memory trade-off). Default `10`. Delegates to `slidingWindow`.
+</ParamField>
+
+## Cadences
+
+The `resetCadence` option accepts a `QuotaCadence` value — one of the following strings:
+
+| Value | Reset boundary | Notes |
+|---|---|---|
+| `"calendar-month"` | 1st of each civil month | Canonical "1M calls/month" billing quota |
+| `"calendar-week"` | `weekStartsOn` each week | ISO week (Mon) by default |
+| `"calendar-day"` | Local midnight | Uses `offsetMinutes` for timezone |
+| `"fixed"` | Every `periodMs` from `anchor` | Epoch-aligned by default |
+| `"rolling"` | Trailing `periodMs` window | Delegates to `slidingWindow` |
+
+The `calendar-*` cadences compute the true next civil boundary using dependency-free proleptic-Gregorian math (Howard Hinnant's `days_from_civil` / `civil_from_days`), reproduced verbatim in the atomic Lua script. This means `resetAt` is the actual next 1st of the month — including February 28 in non-leap years and February 29 in leap years.
+
+### Leap-year correctness
+
+<Note>
+  Calendar boundaries are computed correctly for leap years. A `"calendar-month"` quota resets at the true civil 1st of each month: January (31 days), February (28 or 29), March (31), etc. You do not need to account for month length — ThrottleKit handles it.
+</Note>
+
+### Fixed UTC offset — not DST-aware
+
+The `offsetMinutes` option applies a **fixed UTC offset** to calendar cadences, not a DST-aware timezone. For example, `offsetMinutes: -300` means "UTC−5 always" — it does not switch between EST and EDT. This is an explicit design decision: DST transitions cannot be reproduced in Redis Lua without bundling a timezone database, which would break the bit-identity guarantee between the JavaScript and Lua paths. A fixed offset is the only calendar arithmetic that is reproducible byte-for-byte in Lua.
+
+<Warning>
+  If your billing periods must reset at local civil midnight in a DST-observing timezone, use a fixed offset that matches your timezone's standard offset and document the twice-yearly ±1h discrepancy. Most billing systems run in UTC or a fixed offset anyway.
+</Warning>
+
+## Code examples
+
+### Monthly quota (SaaS billing)
+
+```ts
+import { rateLimit, quota } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: quota({
+    limit: 1_000_000,
+    resetCadence: "calendar-month",
+    // offsetMinutes: 0 (UTC) — default
+  }),
+});
+
+const decision = await limiter.check("tenant-acme");
+console.log(
+  "allowed:", decision.allowed,
+  "remaining:", decision.remaining,
+  "resetAt:", new Date(decision.resetAt).toISOString(), // true next 1st of month
+);
+
+if (!decision.allowed) {
+  console.log(`quota exhausted; resets in ${Math.ceil(decision.retryAfterMs / 3_600_000)}h`);
+}
+```
+
+### Daily quota with timezone offset
+
+```ts
+import { rateLimit, quota } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: quota({
+    limit: 10_000,
+    resetCadence: "calendar-day",
+    offsetMinutes: 330, // IST (UTC+5:30) — fixed offset
+  }),
+});
+
+const decision = await limiter.check("user-42");
+// resetAt is IST midnight converted to epoch-ms
+console.log("resets at:", new Date(decision.resetAt).toISOString());
+```
+
+### Fixed-period quota
+
+```ts
+import { rateLimit, quota } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: quota({
+    limit: 500,
+    resetCadence: "fixed",
+    periodMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+    anchor: 0,  // epoch-aligned (default)
+  }),
+});
+```
+
+### Rolling window quota
+
+```ts
+import { rateLimit, quota } from "throttlekit";
+
+// Delegates to slidingWindow — trailing window, no hard reset boundary
+const limiter = rateLimit({
+  strategy: quota({
+    limit: 10_000,
+    resetCadence: "rolling",
+    periodMs: 30 * 24 * 60 * 60 * 1000, // 30-day trailing window
+    buckets: 10, // default
+  }),
+});
+```
+
+## Bit-identical JS and Lua
+
+The calendar arithmetic (including leap-year handling) is implemented in both TypeScript and inline Lua, and verified to be bit-identical by the dual-path conformance suite. The Lua form of `civil_from_days` and `days_from_civil` is transcribed verbatim from the TypeScript, so a distributed deployment (Redis) produces the same `resetAt` as an in-process deployment.
+
+## When to use quota
+
+- **Metered SaaS** — "1,000,000 API calls per month" or "10 GB of storage per billing period".
+- **Per-tenant usage caps** — budget that resets on the 1st of each month, aligned to your billing cycle.
+- **Weekly or daily allowances** — limits that reset at the start of the work week or at midnight in a fixed timezone.
+- **Fixed billing windows** — enterprise contracts with a fixed start date and renewal period.
+
+<Tip>
+  For pure rate limiting (requests per second/minute) without a billing-period concept, use [GCRA](/algorithms/gcra) or [token bucket](/algorithms/token-bucket). Quota is specifically designed for the case where `resetAt` must align to a real calendar boundary.
+</Tip>

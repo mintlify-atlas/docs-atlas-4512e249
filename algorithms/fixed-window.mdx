@@ -1,0 +1,102 @@
+---
+title: "Fixed Window"
+sidebarTitle: "Fixed Window"
+description: "The cheapest rate-limiting counter: requests are tallied in epoch-aligned windows of fixed width and reset hard at every window boundary."
+---
+
+The fixed window strategy counts requests within epoch-aligned windows of `windowMs` milliseconds and denies once `limit` is reached. Each window is defined by `floor(now / windowMs) * windowMs` — the largest multiple of `windowMs` that does not exceed the current time. When the clock crosses a window boundary, the count resets to zero and the full `limit` becomes available again.
+
+Fixed window is the cheapest possible counter: O(1) memory per key, trivially cheap CPU, and a Redis implementation that maps directly to `HSET` + `PEXPIRE`. It is the right choice for coarse rate caps where the boundary burst trade-off is acceptable.
+
+## Options
+
+<ParamField path="limit" type="number" required>
+  The maximum number of requests admitted within each window. Once `limit` is reached, all further requests in that window are denied (without consuming anything). The counter resets to zero at the start of every new window.
+</ParamField>
+
+<ParamField path="windowMs" type="number" required>
+  The window width in milliseconds. Windows are epoch-aligned: `floor(now / windowMs) * windowMs`. For example, `windowMs: 60_000` produces minute-aligned windows that start at 00:00, 00:01, 00:02, etc.
+</ParamField>
+
+## The boundary burst problem
+
+Because windows reset on hard boundaries, a client can exhaust the full `limit` at the very end of one window and then immediately exhaust the full `limit` again at the start of the next. This means up to **2×limit requests can be admitted across a single window boundary**.
+
+```
+window N     |-------- limit ------->| boundary
+window N+1   |<-------- limit --------| ...
+              ↑ up to 2×limit in a short span
+```
+
+<Warning>
+  The 2×limit boundary burst is a documented property of fixed window, not a bug. If your use case requires smooth pacing or boundary-free accuracy, use [GCRA](/algorithms/gcra), [token bucket](/algorithms/token-bucket), or a [sliding window](/algorithms/sliding-window) instead.
+</Warning>
+
+A denied request never consumes — `remaining` accurately reflects how many units are still available in the current window, even across repeated denials.
+
+## Code example
+
+```ts
+import { rateLimit, fixedWindow } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: fixedWindow({
+    limit: 100,
+    windowMs: 60_000, // 100 requests per minute, minute-aligned
+  }),
+});
+
+const decision = await limiter.check("user-42");
+console.log(
+  "allowed:", decision.allowed,
+  "remaining:", decision.remaining,
+  "resetAt:", new Date(decision.resetAt).toISOString(),
+);
+
+if (!decision.allowed) {
+  // retryAfterMs is the time until the current window expires and resets
+  console.log(`window full; resets in ${decision.retryAfterMs}ms`);
+}
+```
+
+### Observing the boundary reset
+
+```ts
+import { rateLimit, fixedWindow, ManualClock, MemoryStore } from "throttlekit";
+
+const clock = new ManualClock(0);
+const limiter = rateLimit({
+  strategy: fixedWindow({ limit: 3, windowMs: 1_000 }),
+  clock,
+  store: new MemoryStore({ clock }),
+});
+
+// Exhaust the window
+console.log(limiter.checkSync("k").allowed); // true  (1/3)
+console.log(limiter.checkSync("k").allowed); // true  (2/3)
+console.log(limiter.checkSync("k").allowed); // true  (3/3)
+console.log(limiter.checkSync("k").allowed); // false — window full
+
+// Advance past the window boundary
+clock.advance(1_000);
+console.log(limiter.checkSync("k").allowed); // true  — new window, count reset
+```
+
+## State shape
+
+Fixed window stores two values per key:
+
+- **`start`** — the epoch-ms start of the active window.
+- **`count`** — units consumed within that window.
+
+A stale `start` (from a previous window) is treated as a count of zero, so the counter resets automatically without any explicit cleanup.
+
+## When to use fixed window
+
+- **Coarse, high-volume caps** — when the simplest possible counter is sufficient and the 2×limit burst at boundaries is acceptable.
+- **Abuse prevention** — blocking a key after N requests in a minute, where a brief boundary burst is tolerable.
+- **Low-memory requirements** — when you need to rate-limit millions of keys with minimal per-key storage.
+
+<Tip>
+  Fixed window is the cheapest strategy. If boundary bursts matter, reach for [sliding window](/algorithms/sliding-window) (bounded memory, near-exact) or [GCRA](/algorithms/gcra) (smooth pacing). If the limit is low and you need exact accuracy, use [sliding window log](/algorithms/sliding-window#sliding-window-log-exact).
+</Tip>

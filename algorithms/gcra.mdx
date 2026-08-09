@@ -1,0 +1,116 @@
+---
+title: "GCRA — Generic Cell Rate Algorithm"
+sidebarTitle: "GCRA"
+description: "The default ThrottleKit strategy: one float per key, smooth pacing, configurable burst allowance, and 169 ns/op in-process performance."
+---
+
+GCRA (Generic Cell Rate Algorithm) is the default strategy in ThrottleKit. It tracks a single number per key — the *theoretical arrival time* (TAT), the earliest instant the next request would be perfectly paced — to produce a smooth, mathematically rigorous rate limit with a configurable burst allowance. Because the entire state is one float, GCRA costs O(1) memory and CPU, and its atomic Lua program is the smallest possible Redis script among all the strategies.
+
+## Options
+
+<ParamField path="limit" type="number" required>
+  The sustained throughput: the maximum number of requests admitted per `periodMs`. Together with `periodMs`, this derives the *emission interval* `T = periodMs / limit` (milliseconds between back-to-back requests at the steady rate).
+</ParamField>
+
+<ParamField path="periodMs" type="number" required>
+  The period over which `limit` applies, in milliseconds. For example, `limit: 100, periodMs: 60_000` means 100 requests per minute.
+</ParamField>
+
+<ParamField path="burst" type="number">
+  The maximum number of requests admissible instantaneously from a cold or idle key — the burst allowance. Defaults to `limit`. A cold key (no prior traffic) admits exactly `burst` requests back-to-back, then paces at one request per `T` milliseconds. Request `burst + 1` is denied. A single request whose `cost` exceeds `burst` can never be satisfied.
+</ParamField>
+
+## How burst works
+
+The burst allowance is implemented through the *burst tolerance window* `tau = T * burst`. When a key has been idle long enough for the TAT to fall back to `now`, the first `burst` requests are all admitted instantly because `now >= newTat - tau` for each of them. After that, the algorithm enforces smooth pacing at the emission interval `T`.
+
+Setting `burst` higher than `limit` lets a client absorb a short spike above the sustained rate. Setting `burst: 1` means no instantaneous burst at all — every request must wait at least `T` milliseconds after the previous one.
+
+<Note>
+  `burst` defaults to `limit`, so a limiter configured with only `limit` and `periodMs` already allows the full limit as an instantaneous burst from a cold start. Set a lower `burst` if you want to cap spikes while preserving the same sustained throughput.
+</Note>
+
+## Basic example
+
+```ts
+import { rateLimit, gcra } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 100, periodMs: 60_000, burst: 20 }),
+  // store defaults to a fresh in-process MemoryStore
+});
+
+// Async check (any store)
+const decision = await limiter.check("user-42");
+console.log(decision.allowed, decision.remaining, decision.retryAfterMs);
+
+// Synchronous zero-await fast path (MemoryStore only)
+const sync = limiter.checkSync("user-42");
+if (!sync.allowed) {
+  throw new Error(`rate limited; retry in ${sync.retryAfterMs}ms`);
+}
+
+// Variable-cost request (e.g., a bulk operation)
+const heavy = await limiter.check("user-42", 5); // costs 5 units
+console.log("heavy allowed:", heavy.allowed, "remaining:", heavy.remaining);
+```
+
+### Deterministic testing with ManualClock
+
+```ts
+import { rateLimit, gcra, ManualClock, MemoryStore } from "throttlekit";
+
+const clock = new ManualClock(0);
+const limiter = rateLimit({
+  strategy: gcra({ limit: 2, periodMs: 1_000 }), // burst defaults to 2
+  clock,
+  store: new MemoryStore({ clock }),
+});
+
+// A cold key admits exactly `burst` requests instantaneously
+console.log(limiter.checkSync("k").allowed); // true
+console.log(limiter.checkSync("k").allowed); // true
+console.log(limiter.checkSync("k").allowed); // false — burst exhausted
+
+clock.advance(500); // one emission interval (1000 / 2 = 500 ms)
+console.log(limiter.checkSync("k").allowed); // true — one slot has replenished
+```
+
+## Isomorphic JS + Lua execution
+
+GCRA's decision logic is written **once** in TypeScript and compiled to an equivalent atomic Lua script. The Lua form stores the TAT as `string.format('%.17g', newTat)` so it round-trips through Redis at full double precision. Both paths derive `T`, `tau`, and the admission test from the same integer inputs with identical rounding, so the in-process and Redis decisions are **bit-identical** — verified by a dual-path conformance suite.
+
+<Tip>
+  You can switch from `MemoryStore` to `RedisStore` (or Postgres, DynamoDB, Deno KV, Cloudflare) without changing the strategy configuration. The decision you observe in development is the decision you get in production.
+</Tip>
+
+## GCRA vs token bucket
+
+Both algorithms are mathematically equivalent in behavior, but differ in what they expose and store:
+
+| | GCRA | Token Bucket |
+|---|---|---|
+| State per key | One float (TAT) | Two floats (`tokens`, `last`) |
+| `remaining` | Derived from TAT math | Explicit token count |
+| Wire footprint | Smaller (one Redis `GET`/`SET`) | Larger (Redis `HASH`) |
+| Best for | Default choice, minimal overhead | Client-visible "tokens remaining" UX |
+
+Choose GCRA when you want the smallest correct primitive. Choose token bucket when you want to surface an explicit token count in API responses or client-facing headers.
+
+## When to use GCRA
+
+- **General-purpose API rate limiting** — the default choice for per-user, per-IP, or per-tenant limits.
+- **Smooth pacing** — traffic emerges at a steady cadence rather than in bursts at window boundaries.
+- **High-throughput hot paths** — at **169 ns/op and ~0 allocations** on the synchronous in-process path, GCRA is the fastest strategy in ThrottleKit.
+- **Distributed systems** — the one-float state minimizes serialization cost on remote stores.
+
+## Performance
+
+| Path | Throughput | Latency |
+|---|---|---|
+| `checkSync` (in-process) | 5.9M ops/s | **169 ns/op**, ~0 B/op |
+| `check` (async, in-process) | 3.3M ops/s | ~300 ns/op |
+
+<Note>
+  Benchmarks measured on Node 24 / AMD Ryzen AI 9 HX 370, single hot key. See `BENCH.md` for full methodology.
+</Note>

@@ -1,0 +1,94 @@
+---
+title: "ThrottleKit — Rate Limiting You Can Actually Prove"
+sidebarTitle: "Introduction"
+description: "ThrottleKit governs rate, concurrency, and cost with provable fleet-size-independent bounds, a 169 ns synchronous fast path, and zero runtime dependencies."
+---
+
+ThrottleKit is a pluggable, framework-agnostic rate-limiting toolkit for Node and the web. Where most limiters count requests and hope for the best, ThrottleKit governs the three axes a real request must clear — **rate**, **concurrency**, and **cost** — each behind a bound you can state and prove. It ships a **169 ns** synchronous in-process fast path, zero runtime dependencies, and the same algorithm running bit-identically across six storage backends — in memory, on Redis, on Postgres, and on the edge.
+
+<Note>
+  ThrottleKit is **1.0** — the public API is frozen under SemVer. The [STABILITY.md](https://github.com/AmeyaBorkar/throttlekit/blob/main/STABILITY.md) promise covers algorithms, stores, adapters, and federation. Experimental features (adaptive lease sizing, joint-LP policy, learned escrow) are opt-in and tagged `@experimental`.
+</Note>
+
+## Why ThrottleKit exists
+
+Counting requests is the easy 10% of production rate limiting. The hard part is being correct under concurrency, correct across a fleet of many processes, cheap enough to run on every request, resilient when the backing store is down, and honest about the trade-offs you are making.
+
+The popular alternatives each solve a slice of this and punt on the rest:
+
+- **`express-rate-limit`** is ergonomic but Express-only, primarily fixed-window, and leans on store `increment` semantics rather than a single atomic operation — so distributed accuracy depends entirely on the store adapter.
+- **`rate-limiter-flexible`** is powerful and backend-rich but is not edge-native, has no Web-standard `fetch` story, no GCRA, and no adaptive concurrency.
+- **`@upstash/ratelimit`** is excellent for serverless/edge over HTTP Redis, with multi-region and an ephemeral deny cache — but it is bound to Upstash's HTTP Redis, offers no pure in-memory mode, and is rate-only (no concurrency or cost axis).
+
+None of them give you the same algorithm running identically in-process and in Redis, a hot path that avoids the network under load, GCRA as a first-class citizen, or adaptive concurrency backpressure in the same package. ThrottleKit does.
+
+## How it compares
+
+Every row is a shipped, tested ThrottleKit feature. The comparison reflects each library's documented capabilities.
+
+| | `express-rate-limit` | `rate-limiter-flexible` | `@upstash/ratelimit` | **ThrottleKit** |
+|---|:--:|:--:|:--:|:--:|
+| Provable, **fleet-size-independent** overshoot bound (TLA⁺-checked) | – | – | – | **✓** |
+| Synchronous, allocation-free check | – | – | – | **✓ 169 ns** |
+| One algorithm, proven **bit-identical** across backends | – | – | – | **✓ (6 stores)** |
+| Two-tier leasing — amortized round trips, *bounded* overshoot | – | – | – | **✓** |
+| LLM **token-budget escrow** (post-hoc cost axis) | – | – | – | **✓ (TALE)** |
+| Unified **rate × concurrency × cost** in one decision | – | – | – | **✓** |
+| Weighted-fair share · overload shedding · fixed-memory DDoS sketch | – | – | – | **✓** |
+| Live **binding-axis** monitoring dashboard | – | – | – | **✓ (Lens)** |
+| **Plan** a limit change before deploy — replay traffic → allow↔deny diff | – | – | – | **✓ (Policy Plans)** |
+| Framework / transport adapters | 1 (Express) | a few | – | **13** |
+| Zero runtime dependencies | – | – | – | **✓** |
+
+## Architecture: three cleanly separated concerns
+
+ThrottleKit treats rate limiting as three concerns that never entangle each other:
+
+```
+            ┌──────────────┐     check(key, cost)      ┌───────────────┐
+ request ──►│   Adapter    │ ─────────────────────────►│   Limiter     │
+            │ (express /   │                            │  strategy +   │
+            │  fetch /     │◄─────────  Decision ───────│  store + key  │
+            │  core)       │                            └──────┬────────┘
+            └──────────────┘                                   │ apply(key, transform)
+                                                               ▼
+                                              ┌────────────────────────────────┐
+                                              │              Store              │
+                                              │  Memory │ Redis(Lua) │ TwoTier  │
+                                              └────────────────────────────────┘
+```
+
+**Algorithms (Strategies)** are pure functions of `(state, now, cost)` — no I/O, no clock reads. This makes them trivially testable and portable to an atomic Redis Lua form. Adding a new algorithm never touches a store.
+
+**Stores** expose exactly one mutating primitive: an atomic `apply`. The contract is: run a read-modify-write transform atomically per key. That is the entire surface a backend author must satisfy. Adding a new backend never touches an algorithm.
+
+**Adapters** are thin glue to your framework — Express, Fastify, Koa, Hono, Next.js, NestJS, the Web `fetch` API, and more. They extract a key from the request, call the limiter, and emit standard HTTP headers.
+
+<Tip>
+  The separation means the same `gcra({ limit: 100, periodMs: 60_000 })` strategy runs as a 169 ns synchronous in-process check with `MemoryStore`, as a single atomic `EVALSHA` round trip on Redis, and as a nearly-zero-network leased budget across a fleet — all from one configuration.
+</Tip>
+
+## Key differentiators
+
+**Provable overshoot bound, independent of fleet size.** Two-tier leasing is model-checked in TLA⁺/TLC. With `windowCoupled: true`, worst-case global admissions are exactly `Limit`, no matter how many nodes are in the fleet. Most limiters cannot state a bound at all.
+
+**Sub-microsecond synchronous checks.** `checkSync` returns a complete `Decision` in **169 ns/op (5.9M ops/s), effectively allocation-free** — a true sync API for hot paths that should not pay for an `await`.
+
+**One algorithm, six backends, proven bit-identical.** All numeric `Decision` fields are integers so that the JavaScript path and the Redis-Lua path produce byte-equal values. A dual-path conformance suite — including a 200-way concurrent read-modify-write — proves this holds across every backend.
+
+**Batteries included, dependencies not.** 24 subpath entry points — 8 strategies, 6 storage backends, 13 framework/transport adapters — and **zero runtime dependencies**.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Install, create your first limiter, and handle a Decision in under five minutes.
+  </Card>
+  <Card title="Installation" icon="package" href="/installation">
+    Package manager commands, peer deps, and all 24 entry points.
+  </Card>
+  <Card title="Strategies" icon="function" href="/concepts/strategies">
+    GCRA, token bucket, sliding window, adaptive concurrency, and more.
+  </Card>
+  <Card title="Two-Tier Limiting" icon="server" href="/concepts/two-tier">
+    L1 + L2 architecture with strict, cached-deny, and leased modes.
+  </Card>
+</CardGroup>

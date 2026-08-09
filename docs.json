@@ -1,72 +1,117 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "ThrottleKit",
+  "theme": "luma",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#7c7c79",
+    "light": "#050505",
+    "dark": "#eae8d9"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
+  "favicon": "https://media.brand.dev/fbfcd1a8-3216-4858-9a02-ea1b57483215.svg",
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "https://media.brand.dev/ae2fc964-d538-478d-b46e-1d0cd83ade0b.svg",
+    "dark": "https://media.brand.dev/ae2fc964-d538-478d-b46e-1d0cd83ade0b.svg"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/AmeyaBorkar/throttlekit"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/AmeyaBorkar/throttlekit"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/decision",
+              "concepts/strategies",
+              "concepts/stores",
+              "concepts/two-tier"
+            ]
+          },
+          {
+            "group": "Algorithms",
+            "pages": [
+              "algorithms/gcra",
+              "algorithms/token-bucket",
+              "algorithms/fixed-window",
+              "algorithms/sliding-window",
+              "algorithms/leaky-bucket",
+              "algorithms/quota",
+              "algorithms/adaptive-concurrency"
+            ]
+          },
+          {
+            "group": "Storage Backends",
+            "pages": [
+              "stores/memory",
+              "stores/redis",
+              "stores/postgres",
+              "stores/dynamodb",
+              "stores/edge"
+            ]
+          },
+          {
+            "group": "Framework Adapters",
+            "pages": [
+              "adapters/overview",
+              "adapters/node-frameworks",
+              "adapters/edge-serverless"
+            ]
+          },
+          {
+            "group": "Advanced Features",
+            "pages": [
+              "advanced/distributed-leasing",
+              "advanced/unified-admission",
+              "advanced/multi-dimensional",
+              "advanced/sketch-ddos",
+              "advanced/observability",
+              "advanced/policy-plans",
+              "advanced/cli"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/rate-limit",
+              "api/two-tier",
+              "api/types"
+            ]
+          },
+          {
+            "group": "Subpath Exports",
+            "pages": [
+              "api/subpaths/redis",
+              "api/subpaths/postgres",
+              "api/subpaths/adapters",
+              "api/subpaths/admission",
+              "api/subpaths/policy-testkit"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

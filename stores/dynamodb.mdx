@@ -1,0 +1,180 @@
+---
+title: "DynamoDB Store"
+sidebarTitle: "DynamoDB"
+description: "Exact distributed rate limiting on AWS DynamoDB — lock-free conditional-write CAS, native TTL, and in-process coalescing for hot keys."
+---
+
+`DynamoStore` is the AWS-native distributed backend for ThrottleKit. It uses **optimistic concurrency** with a conditional `PutItem` on a `version` attribute — a lock-free compare-and-set (CAS) that makes N concurrent increments from any number of processes land exactly N, without ever holding a lock. Native DynamoDB TTL (`expires_at` in epoch seconds) reclaims storage automatically with no background sweep to manage.
+
+## How it works
+
+```
+GetItem  { ConsistentRead: true }                  -- read state + version; lazy-expire in JS
+<run transform(state) in JavaScript>                -- the same pure code every backend runs
+PutItem  ConditionExpression="version = :v"         -- commit iff unchanged
+  -- or "attribute_not_exists(#pk)" on first touch
+  -- ConditionalCheckFailedException ⇒ re-read and retry
+```
+
+When another process writes between our read and our write, DynamoDB rejects the `PutItem` with a `ConditionalCheckFailedException`. The store re-reads the item and retries — up to `maxRetries` times. **In-process coalescing** (a per-key promise chain) serializes applies from the same process, so CAS retries are spent only on genuine cross-process races and not on self-contention.
+
+State is stored as JSON text, identical to the Redis and Postgres backends. A value round-trips as the exact IEEE-754 double so decisions are bit-identical across all stores.
+
+## Installation
+
+`DynamoStore` is exported from the `throttlekit/dynamodb` subpath. You also need the AWS SDK v3 as a peer dependency.
+
+```bash
+npm install throttlekit @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
+```
+
+## Table setup
+
+Create a DynamoDB table with a **single string partition key** (no sort key). Optionally enable TTL on the `expires_at` attribute to let DynamoDB reclaim expired items automatically.
+
+```
+Table name:       throttlekit          (or any name you pass as tableName)
+Partition key:    pk (String)          (or any name you pass as hashKey)
+TTL attribute:    expires_at           (optional but recommended)
+```
+
+Using the AWS CLI:
+
+```bash
+aws dynamodb create-table \
+  --table-name throttlekit \
+  --attribute-definitions AttributeName=pk,AttributeType=S \
+  --key-schema AttributeName=pk,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST
+
+# Enable TTL (optional)
+aws dynamodb update-time-to-live \
+  --table-name throttlekit \
+  --time-to-live-specification Enabled=true,AttributeName=expires_at
+```
+
+## Quick example
+
+```ts
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  DeleteCommand,
+} from "@aws-sdk/lib-dynamodb";
+import { rateLimit, gcra } from "throttlekit";
+import { DynamoStore, type DynamoClientLike } from "throttlekit/dynamodb";
+
+// Adapt the AWS SDK v3 document client to the minimal interface ThrottleKit needs.
+const doc = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const client: DynamoClientLike = {
+  get:    (input) => doc.send(new GetCommand(input)).then((r) => r.Item),
+  put:    (input) => doc.send(new PutCommand(input)).then(() => undefined),
+  delete: (input) => doc.send(new DeleteCommand(input)).then(() => undefined),
+};
+
+const store = new DynamoStore({
+  client,
+  tableName: "throttlekit",
+  prefix: "api",
+});
+
+const limiter = rateLimit({
+  strategy: gcra({ limit: 1_000, periodMs: 60_000, burst: 100 }),
+  store,
+});
+
+const result = await limiter.check("user-42");
+console.log(result.allowed, result.remaining, result.limit);
+
+// Spend more than one unit in one atomic check
+const heavy = await limiter.check("user-42", 10);
+console.log(heavy.allowed, heavy.remaining);
+```
+
+## Options
+
+<ParamField path="client" type="DynamoClientLike" required>
+  A document client satisfying the `DynamoClientLike` interface: `get`,
+  `put`, and `delete` methods using document-style (plain JS) attribute values.
+  ThrottleKit never closes a client it is given.
+</ParamField>
+
+<ParamField path="tableName" type="string" required>
+  The DynamoDB table name. You provision the table — there is no sensible
+  default. The table must have a single string partition key (no sort key).
+</ParamField>
+
+<ParamField path="hashKey" type="string" default='"pk"'>
+  The partition-key attribute name on the table. Must match what you specified
+  when creating the table.
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Storage key namespace. Keys are stored as `prefix:key`. Use this to share one
+  table across multiple limiters without key collisions.
+</ParamField>
+
+<ParamField path="maxRetries" type="number" default="16">
+  Bounded retries for the conditional-write compare-and-set. In-process applies
+  to the same key are already coalesced, so retries are spent only on genuine
+  cross-process races. `16` tolerates heavy contention on a single hot key. If
+  all retries are exhausted a `StoreUnavailableError` is thrown.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Time source for lazy expiry decisions. Defaults to the system clock. Inject a
+  `ManualClock` to drive expiry deterministically in tests. DynamoDB's own
+  native TTL deletion (on `expires_at` epoch seconds) can lag hours — the
+  injected clock is what keeps decisions correct in the meantime.
+</ParamField>
+
+## Item schema
+
+Each item written to the table has the following attributes:
+
+| Attribute | Type | Description |
+|---|---|---|
+| `pk` (or `hashKey`) | String | Namespaced rate-limit key |
+| `state` | String | JSON-encoded algorithm state |
+| `expires_at` | Number | Epoch **seconds** — used by DynamoDB native TTL |
+| `expires_at_ms` | Number | Epoch **milliseconds** — the authoritative logical expiry for reads |
+| `version` | Number | Monotonic CAS token, incremented on every write |
+
+<Note>
+  `expires_at` is in epoch **seconds** for DynamoDB's native TTL reclamation,
+  while `expires_at_ms` is the authoritative millisecond deadline used for
+  read-time lazy expiry. Both fields are always written together.
+</Note>
+
+## Expiry
+
+Decisions are kept correct by **lazy expiry in JavaScript**: an item past its `expires_at_ms` reads as absent, regardless of whether DynamoDB has physically deleted it yet. DynamoDB's TTL deletion can lag up to several hours; the lazy check is what guarantees correctness. Enabling TTL on `expires_at` is still recommended — it keeps table size bounded and reduces read costs over time.
+
+## When to use
+
+`DynamoStore` is a strong fit when:
+
+- Your application already runs on **AWS** and uses DynamoDB elsewhere.
+- You are building a **serverless** workload (Lambda, API Gateway) and want a managed, no-ops persistence layer.
+- You want **native TTL** to handle storage reclamation without running a background sweep.
+- You need **durable counters** that survive Lambda cold starts and instance recycling.
+
+<Note>
+  `DynamoStore` is async-only. `limiter.checkSync(key)` will throw at
+  runtime — always use `await limiter.check(key)` with this backend.
+</Note>
+
+## Failure behavior
+
+When the DynamoDB SDK call fails (network error, throttling, table not found), `apply` rejects with the SDK error. If the CAS retries are exhausted under extreme single-key contention, a `StoreUnavailableError` is thrown. The limiter's `fail` policy (`"open"` or `"closed"`) controls what a rejection means for your application. Committed counts are preserved in DynamoDB across Lambda cold starts, reconnects, and even AWS service interruptions — the counters resume exactly from where they left off.
+
+<Warning>
+  DynamoDB charges per read and write capacity unit consumed. In-process
+  coalescing means same-process applies to one key take exactly one clean
+  version bump — no wasted retries from self-contention. For hot keys in a
+  multi-process fleet, consider wrapping this store as the L2 of
+  `twoTier({ mode: "leased" })` to reduce the number of DynamoDB writes per
+  request.
+</Warning>

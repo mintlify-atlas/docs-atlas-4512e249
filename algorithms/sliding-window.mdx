@@ -1,0 +1,163 @@
+---
+title: "Sliding Window"
+sidebarTitle: "Sliding Window"
+description: "Two variants: a sub-bucketed counter for bounded memory near-exact rolling windows, and an exact timestamp log for precise low-limit enforcement."
+---
+
+ThrottleKit provides two sliding window strategies that occupy different positions on the memory-vs-accuracy trade-off spectrum:
+
+- **`slidingWindow`** — a sub-bucketed ring counter. Near-exact rolling window at any limit with O(buckets) memory per key. The sweet spot between fixed window (cheap, 2× boundary error) and the exact log (precise, unbounded memory).
+- **`slidingWindowLog`** — an exact timestamp log. Stores every accepted unit's timestamp and counts those within the trailing `windowMs`. O(limit) memory per key; use for low or moderate limits where precision matters absolutely.
+
+Both strategies guarantee that **a denied request never consumes** — `remaining` stays accurate across repeated denials, and the count is always from a true rolling window with no reset spike at boundaries.
+
+---
+
+## slidingWindow — sub-bucketed counter
+
+### How it works
+
+The window is divided into `S` equal sub-buckets (default `S = 10`), each of width `w = windowMs / S`. The current tick index is `c = floor(now / w)`. On each check, ThrottleKit:
+
+1. Sums the counts for the `S` newest in-window ticks (the "full" buckets).
+2. Weights the oldest partial bucket: `oldest * ((w − elapsed) / w)`, where `elapsed = now − c * w`.
+3. Estimates the total as `full + oldest * weight`.
+4. Admits if `estimate + cost <= limit`.
+
+The approximation error is bounded by **one bucket** (≈ `1/buckets` of the window), because only the single oldest bucket is weighted rather than measured exactly. With `buckets: 10`, the maximum error is 10% of the window width.
+
+### Options
+
+<ParamField path="limit" type="number" required>
+  The maximum units admitted within any trailing `windowMs`.
+</ParamField>
+
+<ParamField path="windowMs" type="number" required>
+  The rolling window length in milliseconds. The window trails the current time — there are no hard reset boundaries.
+</ParamField>
+
+<ParamField path="buckets" type="number">
+  Number of sub-buckets the window is divided into. More buckets → smaller approximation error (bounded by `~1/buckets` of the window) at O(buckets) memory per key. Default `10`. Setting `buckets: 1` recovers the classic single-previous-window weighted estimator.
+</ParamField>
+
+### Code example
+
+```ts
+import { rateLimit, slidingWindow } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: slidingWindow({
+    limit: 100,
+    windowMs: 60_000, // 100 requests per trailing 60-second window
+    buckets: 10,      // ~10% max error; default
+  }),
+});
+
+const decision = await limiter.check("user-42");
+console.log(
+  "allowed:", decision.allowed,
+  "remaining:", decision.remaining,
+  "retryAfterMs:", decision.retryAfterMs,
+);
+```
+
+### Trade-offs vs fixed window
+
+Unlike fixed window, the sub-bucketed sliding window **does not spike at boundaries** — the rolling estimate smoothly ages out old counts as time advances. The trade-off is O(buckets) memory per key vs O(1) for fixed window.
+
+```ts
+import { rateLimit, slidingWindow, ManualClock, MemoryStore } from "throttlekit";
+
+const clock = new ManualClock(0);
+const limiter = rateLimit({
+  strategy: slidingWindow({ limit: 5, windowMs: 1_000, buckets: 2 }),
+  clock,
+  store: new MemoryStore({ clock }),
+});
+
+// Spend 3 units at t=0
+limiter.checkSync("k"); // 1
+limiter.checkSync("k"); // 2
+limiter.checkSync("k"); // 3
+
+// At t=500ms (halfway through window), the oldest bucket is weighted at ~50%
+// so the estimate is ~1.5, not 3 — no hard reset, no boundary spike
+clock.advance(500);
+console.log(limiter.checkSync("k").allowed); // true — rolling estimate has decayed
+```
+
+---
+
+## slidingWindowLog — exact
+
+### How it works
+
+The log stores the timestamp of every accepted unit and counts those within `now - windowMs`. Pruning the stale prefix is an index walk with no allocation. In Redis it uses a sorted set (`ZREMRANGEBYSCORE` + `ZCARD` + `ZADD`) inside one atomic Lua script, with members named by deterministic rank so the script is reproducible without `TIME`.
+
+`retryAfterMs` is **exact**: the time until the oldest in-window unit expires and frees a slot.
+
+### Options
+
+<ParamField path="limit" type="number" required>
+  The maximum units accepted within any trailing `windowMs`. Because the log stores one timestamp per unit, memory is O(limit) per key.
+</ParamField>
+
+<ParamField path="windowMs" type="number" required>
+  The rolling window length in milliseconds.
+</ParamField>
+
+<Warning>
+  `slidingWindowLog` uses O(limit) memory per key. For a limit of 1,000,000 requests/month, the log would need to store up to one million timestamps per active key. Use `slidingWindowLog` only for low or moderate limits (e.g. "5 password resets per hour", "100 API calls per minute"). For high limits, use `slidingWindow` instead.
+</Warning>
+
+### Code example
+
+```ts
+import { rateLimit, slidingWindowLog } from "throttlekit";
+
+const limiter = rateLimit({
+  strategy: slidingWindowLog({
+    limit: 5,
+    windowMs: 3_600_000, // 5 requests per trailing hour — exact
+  }),
+});
+
+const decision = await limiter.check("password-reset:user-42");
+if (!decision.allowed) {
+  // retryAfterMs is exact: time until the oldest accepted request exits the window
+  console.log(`limit reached; retry in ${decision.retryAfterMs}ms`);
+  console.log(`window resets at: ${new Date(decision.resetAt).toISOString()}`);
+}
+```
+
+### Redis compatibility note
+
+On Redis, `slidingWindowLog` uses a sorted set (`ZSET`) per key. This is different from `slidingWindow`, which uses a `HASH` ring. The ZSET approach requires no background cleanup: stale members are pruned atomically on each check via `ZREMRANGEBYSCORE`.
+
+<Tip>
+  If you need Redis compatibility with a pipeline or a custom Lua environment that does not support sorted sets, use `slidingWindow` instead.
+</Tip>
+
+---
+
+## Comparison
+
+| | `slidingWindow` | `slidingWindowLog` |
+|---|---|---|
+| Memory per key | O(buckets) — fixed | O(limit) — grows with limit |
+| Accuracy | Near-exact (error ≤ `1/buckets` of window) | **Exact** |
+| `retryAfterMs` | Advisory approximation | **Exact** |
+| Redis data structure | `HASH` ring | Sorted set (`ZSET`) |
+| Best for | Any limit, bounded memory | Low/moderate limits, exact enforcement |
+
+## When to use each
+
+**Use `slidingWindow` when:**
+- Your limit is high (thousands or more) and you need bounded memory.
+- A small approximation error (default ≤ 10% of window) is acceptable.
+- You want to avoid the boundary burst of fixed window without the memory cost of the log.
+
+**Use `slidingWindowLog` when:**
+- Your limit is low or moderate (single digits to a few hundred).
+- Exact accuracy is required — e.g., password resets, OTP sends, sensitive operations.
+- You need the exact `retryAfterMs` (time until the next slot opens).

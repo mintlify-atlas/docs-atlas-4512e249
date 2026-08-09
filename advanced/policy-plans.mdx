@@ -1,0 +1,254 @@
+---
+title: "Policy Plans"
+sidebarTitle: "Policy Plans"
+description: "Replay recorded traffic against a candidate policy and read the exact allow↔deny diff before deploying — terraform plan for rate limits."
+---
+
+Changing a rate limit is a blind edit: raise `limit` from 100 to 150 and you find out who it lets through (or newly blocks) only in production. **Policy Plans** makes that effect legible before you deploy. Given the policy you run today (`current`), a policy you're considering (`candidate`), and a corpus of recorded arrivals from real traffic, it produces a directional allow↔deny flip ledger — the blast radius of the change — computed entirely off the decision path.
+
+Policy Plans is built on `throttlekit/testkit` (the deterministic recorder/replayer) and `throttlekit/config`, adding no frozen-core change. It is `@experimental` — opt-in, excluded from the 1.x SemVer surface.
+
+## Recording Traffic
+
+The first step is to capture real traffic against your current limiters using `recordLimiter` from `throttlekit/testkit`:
+
+```ts
+import { recordLimiter } from "throttlekit/testkit";
+
+// Record a rate-limited API endpoint
+const apiRec = recordLimiter({
+  strategy: "fixedWindow",
+  limit: 10,
+  windowMs: 1_000,
+});
+
+// Drive real (or simulated) traffic through rec.limiter
+for (let i = 0; i < 14; i++) apiRec.limiter.checkSync("tenant-a"); // 10 allow, 4 deny
+for (let i = 0; i < 6;  i++) apiRec.limiter.checkSync("tenant-b");
+```
+
+`recordLimiter` accepts a `LimiterSpec` — the same shape used by `.throttlekit.yaml` — and returns a `Recording` object with:
+
+- `recording.limiter` — a `Limiter` that records every synchronous decision. **Only** `checkSync` and `checkManySync` are supported; async `check` and `reset` are refused (they cannot be captured deterministically).
+- `recording.clock` — the `ManualClock` driving the recording. Advance it between checks to simulate real arrival timing.
+- `recording.trace()` — a snapshot of the immutable trace recorded so far.
+
+---
+
+## Declaring Policy Sets
+
+```ts
+import { policy, policySet } from "throttlekit/policy";
+
+// The policy currently in production
+const current = policySet(
+  [
+    policy("api",    { strategy: "fixedWindow", limit: 10,   windowMs: 1_000 }),
+    policy("tokens", { strategy: "fixedWindow", limit: 1_000, windowMs: 60_000 }),
+  ],
+  { label: "v1" },
+);
+
+// The candidate change: tighten the API, raise the token budget
+const candidate = policySet(
+  [
+    policy("api",    { strategy: "fixedWindow", limit: 8,    windowMs: 1_000 }),
+    policy("tokens", { strategy: "fixedWindow", limit: 1_500, windowMs: 60_000 }),
+  ],
+  { label: "v2" },
+);
+```
+
+A `Policy` is a named leaf `LimiterSpec` plus a `ReplayFingerprint` that provably rebuilds the exact limiter it describes. A `PolicySet` is a versioned, **content-addressed** bag of policies — its `contentHash` is a SHA-256 over the canonical (sorted) policies, so "did it change?" is a hash comparison.
+
+---
+
+## Building a Corpus
+
+```ts
+import { corpusFromRecordings } from "throttlekit/policy";
+
+const corpus = corpusFromRecordings({
+  api:    apiRec,
+  tokens: costRec,
+});
+```
+
+The corpus maps each policy name to its recorded arrival stream. Two adapters are available:
+
+- **`corpusFromRecordings`** — from live `Recording` objects (the output of `recordLimiter`).
+- **`corpusFromTraces`** — from already-serialized replay traces produced by `arrivalsFromTrace`.
+
+---
+
+## Running the Plan
+
+```ts
+import { plan, renderPlan } from "throttlekit/policy";
+
+const result = plan(current, candidate, corpus);
+console.log(renderPlan(result));
+// → "api: 2 allow→deny, 0 deny→allow over 20 arrivals (ok)"
+// → "tokens: 0 allow→deny, 1 deny→allow over 4 arrivals (ok)"
+```
+
+`plan(current, candidate, corpus)` produces a `Plan` containing a `PolicyDiff` for every policy name present in both sets, plus a `PlanSummary` with set-level `added` / `removed` policy names.
+
+### `PolicyDiff` Fields
+
+Each per-policy diff carries a `PolicyDiffState`:
+
+| State | Meaning |
+|---|---|
+| `ok` | Replayed cleanly; the flip ledger is exact |
+| `empty` | No recorded traffic for this policy |
+| `truncated` | The corpus was a prefix (the trace hit its recording cap); the ledger covers only the prefix and **understates** the full effect |
+| `not-replayable` | A known non-rate axis (concurrency / escrow / joint-LP); observe live via binding-axis attribution |
+| `refused` | A replay precondition was violated (carries a machine-readable `ReplayRefusal` reason) |
+
+And the flip counts:
+
+- `allowToDeny` — a **tightening** (allow→deny): requests the current policy allowed that the candidate would deny (the blast radius)
+- `denyToAllow` — a **loosening**: requests the current policy denied that the candidate would allow
+- `flippedTotal` — `allowToDeny + denyToAllow`
+- `affectedKeys` — number of distinct keys with at least one flip
+- `topFlippedKeys` — the top movers (`KeyFlip[]`), sorted by flip count
+
+---
+
+## CI Gate
+
+```ts
+import { PlanRejectedError, assertPlanAcceptable } from "throttlekit/policy";
+
+try {
+  assertPlanAcceptable(result, {
+    maxAllowToDeny: 1,    // at most 1 request newly 429'd
+    maxDenyToAllow: 100,
+    maxFlippedTotal: 100,
+    requireAllReplayable: true, // fail if any axis is not-replayable
+  });
+  console.log("✓ plan within budget");
+} catch (e) {
+  if (e instanceof PlanRejectedError) {
+    console.error(`✗ plan rejected: ${e.message}`);
+    process.exit(1);
+  }
+  throw e;
+}
+```
+
+`assertPlanAcceptable` throws `PlanRejectedError` carrying a machine-readable violation list when any `PlanBudget` bound is exceeded. Returns silently when within budget. Use this as a CI gate to block deployments that would newly rate-limit more than `N` requests.
+
+### `PlanBudget`
+
+<ParamField path="maxAllowToDeny" type="number">
+  Maximum new 429s introduced by the candidate. The primary blast-radius guard.
+</ParamField>
+
+<ParamField path="maxDenyToAllow" type="number">
+  Maximum new allows (loosening). Useful for security-sensitive policies.
+</ParamField>
+
+<ParamField path="maxFlippedTotal" type="number">
+  Maximum total flips in either direction.
+</ParamField>
+
+<ParamField path="maxAffectedKeys" type="number">
+  Maximum number of distinct keys with any flip.
+</ParamField>
+
+<ParamField path="requireAllReplayable" type="boolean">
+  Fail if any policy in the plan has `state: "not-replayable"` or `state: "refused"`.
+</ParamField>
+
+---
+
+## Full Example
+
+```js
+// examples/policy-plan.mjs
+import {
+  PlanRejectedError,
+  assertPlanAcceptable,
+  corpusFromRecordings,
+  plan,
+  policy,
+  policySet,
+  renderPlan,
+} from "throttlekit/policy";
+import { recordLimiter } from "throttlekit/testkit";
+
+// ── 1. Record real traffic ────────────────────────────────────────────────────
+const apiRec  = recordLimiter({ strategy: "fixedWindow", limit: 10,   windowMs: 1000 });
+const costRec = recordLimiter({ strategy: "fixedWindow", limit: 1000, windowMs: 60_000 });
+
+for (let i = 0; i < 14; i++) apiRec.limiter.checkSync("tenant-a");  // 10 allow, 4 deny
+for (let i = 0; i < 6;  i++) apiRec.limiter.checkSync("tenant-b");
+for (let i = 0; i < 4;  i++) costRec.limiter.checkSync("tenant-a", 300); // 3 admitted, 1 denied
+
+// ── 2. Declare current + candidate ───────────────────────────────────────────
+const current = policySet([
+  policy("api",    { strategy: "fixedWindow", limit: 10,   windowMs: 1000 }),
+  policy("tokens", { strategy: "fixedWindow", limit: 1000, windowMs: 60_000 }),
+], { label: "v1" });
+
+const candidate = policySet([
+  policy("api",    { strategy: "fixedWindow", limit: 8,    windowMs: 1000 }),
+  policy("tokens", { strategy: "fixedWindow", limit: 1500, windowMs: 60_000 }),
+], { label: "v2" });
+
+// ── 3. Plan ──────────────────────────────────────────────────────────────────
+const corpus = corpusFromRecordings({ api: apiRec, tokens: costRec });
+const result = plan(current, candidate, corpus);
+console.log(renderPlan(result));
+
+// ── 4. CI gate ───────────────────────────────────────────────────────────────
+try {
+  assertPlanAcceptable(result, { maxAllowToDeny: 1 });
+  console.log("✓ within budget");
+} catch (e) {
+  if (e instanceof PlanRejectedError) console.log(`✗ ${e.message}`);
+  else throw e;
+}
+```
+
+---
+
+## CI Integration Pattern
+
+Add Policy Plans to your CI pipeline to gate every limit change:
+
+```bash
+# 1. Record a traffic sample during a canary or staging run
+#    (ship a build that records to a file, then promote)
+
+# 2. In CI, replay the recorded trace against the candidate
+node scripts/run-plan.mjs  # exits non-zero on PlanRejectedError
+
+# 3. The PR cannot merge until the blast radius is within budget
+```
+
+A typical `scripts/run-plan.mjs` script reads a saved replay trace (`corpusFromTraces`), builds the candidate policy from the branch's `.throttlekit.yaml`, runs `plan`, and calls `assertPlanAcceptable`.
+
+---
+
+## Limitations
+
+<Warning>
+**The baseline is cold-replayed**, not compared against a warm production node. A cold replay starts from zero state, so it cannot reconstruct a warm node's exact decisions (in-flight state, real wall-clock arrivals). The honest comparison is *current vs candidate, both cold over the same arrival timing* — the diff is attributable purely to the policy change, not to warmup differences. This is stated by design, not papered over.
+</Warning>
+
+<Warning>
+**Concurrency, escrow, and joint-LP axes are not replayable.** These axes involve either non-decision state (a concurrency slot release), or warm/post-hoc state a cold replay cannot reconstruct. They surface as `state: "not-replayable"` rather than being silently fabricated. Observe them live via binding-axis attribution (`throttlekit.binding_axis`).
+</Warning>
+
+A `truncated` corpus understates the full effect — it covers only the recorded prefix. It never overstates. Re-record with a higher `maxSteps` if the corpus is systematically truncated.
+
+<Accordion title="FAQ: What does content-addressed mean for PolicySet?">
+Each `PolicySet` carries a `contentHash` — a SHA-256 over its canonical (name-sorted, key-sorted) policy list plus the unreplayable policy names. This means "which policy set is deployed?" is a single hash, "did the policy change?" is a hash compare, and a stored `PolicySet` is integrity-checked on parse. Versioning uses `POLICY_SET_FORMAT_VERSION`; a stored set with a different version is refused on parse rather than silently misread.
+</Accordion>
+
+<Accordion title="FAQ: Can I use plan() without recordLimiter by providing my own arrivals?">
+Yes. Use `policyCorpus` to build a `PolicyCorpus` from hand-constructed `Arrival[]` arrays, or `corpusFromTraces` to read from serialized `ReplayTrace` JSON. `emptyCorpus` gives you a no-traffic baseline. The `corpusFromRecordings` adapter is just the most convenient path for recording from live traffic.
+</Accordion>

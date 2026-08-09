@@ -1,0 +1,166 @@
+---
+title: "Leaky Bucket"
+sidebarTitle: "Leaky Bucket"
+description: "Traffic shaping via departure scheduling: paces bursty input to a steady output rate, rejecting only when the queue wait exceeds maxQueueMs."
+---
+
+The leaky bucket strategy is a **traffic shaper**, not a rate limiter in the traditional sense. Rather than denying requests that arrive too fast, it *schedules* each accepted request at a precisely paced departure time, smoothing bursty input into a steady output stream at `ratePerSec` units per second. A request is rejected only when its scheduled departure time would exceed `maxQueueMs` from now — i.e., the queue is full.
+
+This makes leaky bucket ideal for pacing outbound calls to a third-party API with a strict rate budget, where you want to absorb spikes by queuing rather than shedding, but still need a safety valve for extreme bursts.
+
+<Note>
+  The leaky bucket's next-departure recurrence is mathematically identical to GCRA's TAT. The key difference: **GCRA rejects when the wait exceeds the burst tolerance; the leaky bucket waits**. The shaper delays rather than denies, and only denies when the wait exceeds `maxQueueMs`.
+</Note>
+
+## Options
+
+<ParamField path="ratePerSec" type="number" required>
+  The steady drain rate in units per second — the paced output rate. The pacing interval per unit is `T = 1000 / ratePerSec` milliseconds. For example, `ratePerSec: 5` paces one departure every 200ms.
+</ParamField>
+
+<ParamField path="maxQueueMs" type="number" required>
+  The maximum time a request may wait in the queue before it is rejected instead of delayed. If the next available departure slot is more than `maxQueueMs` milliseconds away, the reservation is rejected with `accepted: false`. Set to `0` for a pure token-bucket-style drop policy with no queuing.
+</ParamField>
+
+<ParamField path="store" type="Store">
+  Where the next-departure timestamp lives. Defaults to a fresh in-process `MemoryStore`. Provide a `RedisStore` for a distributed shaper that coordinates across multiple processes.
+</ParamField>
+
+<ParamField path="clock" type="Clock">
+  Injectable time source. Defaults to the system clock. Use `ManualClock` for deterministic tests.
+</ParamField>
+
+<ParamField path="prefix" type="string">
+  Key namespace prefix. Useful when multiple shapers share the same store.
+</ParamField>
+
+## The Shaper API
+
+The leaky bucket is exposed as a `Shaper` interface rather than a `Strategy`, because it returns a `Reservation` (with a delay) rather than a `Decision` (allow/deny with remaining count). There are three methods:
+
+### `reserve(key, cost?): Promise<Reservation>`
+
+Reserves a slot and returns a `Reservation` immediately — it **never sleeps**. The returned object has:
+
+- **`accepted: boolean`** — whether the slot was granted (i.e., the wait is within `maxQueueMs`).
+- **`delayMs: number`** — when accepted, how long to wait before proceeding so the output is paced. When rejected, an advisory estimate of how long until the queue would have room.
+
+Use `reserve` when you want to decide whether to sleep yourself (e.g., in a job queue where you enqueue a delayed task).
+
+### `reserveSync(key, cost?): Reservation`
+
+Synchronous version of `reserve`. Requires a synchronous store (e.g., `MemoryStore`). Throws a `ThrottleKitError` if the configured store is async-only.
+
+### `schedule(key, cost?): Promise<void>`
+
+Convenience method: reserves a slot and then sleeps for `delayMs`. Resolves when the slot's departure time arrives, or throws `QueueFullError` if the queue is full. This is the simplest way to pace outbound calls.
+
+### `reset(key): Promise<void>`
+
+Clears a key's queue position, resetting the departure clock to `now`.
+
+## QueueFullError
+
+When a reservation is rejected because the queue is full, `schedule()` throws a `QueueFullError`:
+
+```ts
+import { QueueFullError } from "throttlekit";
+
+try {
+  await shaper.schedule("upstream-api");
+  await callUpstream();
+} catch (err) {
+  if (err instanceof QueueFullError) {
+    console.warn("queue full; retry in", err.retryAfterMs, "ms");
+    return;
+  }
+  throw err;
+}
+```
+
+`QueueFullError.retryAfterMs` is an advisory estimate of how long until the queue drains enough to accept a new reservation.
+
+## Code examples
+
+### reserve — inspect the delay, sleep yourself
+
+```ts
+import { leakyBucket } from "throttlekit";
+
+// 5 units/second drain rate; wait at most 2 seconds before rejecting
+const shaper = leakyBucket({ ratePerSec: 5, maxQueueMs: 2_000 });
+
+// reserve() never sleeps — returns immediately with the paced delay
+const r = await shaper.reserve("upstream-api");
+if (!r.accepted) {
+  console.warn("queue full; retry in", r.delayMs, "ms");
+} else {
+  console.log("slot reserved; wait", r.delayMs, "ms before calling upstream");
+  // await sleep(r.delayMs);
+  // await callUpstream();
+}
+```
+
+### schedule — sleep automatically, then proceed
+
+```ts
+import { leakyBucket, QueueFullError } from "throttlekit";
+
+const shaper = leakyBucket({ ratePerSec: 5, maxQueueMs: 2_000 });
+
+try {
+  // Sleeps for delayMs, then resolves — or throws QueueFullError
+  await shaper.schedule("upstream-api");
+  console.log("slot acquired — calling upstream now");
+  await callUpstream();
+} catch (err) {
+  if (err instanceof QueueFullError) {
+    console.warn("queue full; retry in", err.retryAfterMs, "ms");
+    return;
+  }
+  throw err;
+}
+```
+
+### Deterministic testing with reserveSync
+
+```ts
+import { leakyBucket, ManualClock } from "throttlekit";
+
+const clock = new ManualClock(0);
+// T = 1000 / 2 = 500ms per unit
+const shaper = leakyBucket({ ratePerSec: 2, maxQueueMs: 1_000, clock });
+
+// Cold bucket: first reservation departs immediately
+console.log("res #1 delayMs:", shaper.reserveSync("k").delayMs); // 0
+// Each subsequent reservation is paced 500ms later
+console.log("res #2 delayMs:", shaper.reserveSync("k").delayMs); // 500
+// Third is at 1000ms — exactly at the maxQueueMs boundary (accepted)
+const third = shaper.reserveSync("k");
+console.log("res #3 accepted:", third.accepted, "delayMs:", third.delayMs); // true, 1000
+
+// Fourth would wait 1500ms > maxQueueMs (1000ms) — rejected
+const fourth = shaper.reserveSync("k");
+console.log("res #4 accepted:", fourth.accepted); // false
+```
+
+## Queue semantics vs reject semantics
+
+The leaky bucket operates in a **queue mode** by default: it delays rather than denies, and the queue absorbs short bursts. This is fundamentally different from GCRA or token bucket, which operate in **reject mode**: they give an immediate allow/deny decision with no waiting.
+
+| | Leaky Bucket | GCRA / Token Bucket |
+|---|---|---|
+| On burst | Queues requests, paces output | Rejects requests over the burst |
+| `maxQueueMs` | Safety valve — rejects only when queue is full | N/A — reject is immediate |
+| Return type | `Reservation { accepted, delayMs }` | `Decision { allowed, remaining, ... }` |
+| Best for | Outbound traffic shaping | Inbound rate limiting |
+
+## When to use leaky bucket
+
+- **Pacing outbound API calls** — when your service makes calls to a third-party API with a strict rate budget and you want to absorb short bursts by queuing rather than dropping.
+- **Steady-rate job queues** — when you want to dispatch jobs at a controlled rate regardless of how many arrive at once.
+- **Smooth egress** — when the downstream system is sensitive to bursts and you need to regulate the output rate, not just the input count.
+
+<Warning>
+  The leaky bucket is not appropriate for inbound request limiting where you want an immediate allow/deny decision. For that, use GCRA, token bucket, or a sliding window.
+</Warning>
