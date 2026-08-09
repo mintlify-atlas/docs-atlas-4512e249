@@ -1,5 +1,5 @@
 ---
-title: "Sliding Window"
+title: "Sliding Window Rate Limiter — Sub-bucketed and Exact Log"
 sidebarTitle: "Sliding Window"
 description: "Two variants: a sub-bucketed counter for bounded memory near-exact rolling windows, and an exact timestamp log for precise low-limit enforcement."
 ---
@@ -14,6 +14,8 @@ Both strategies guarantee that **a denied request never consumes** — `remainin
 ---
 
 ## slidingWindow — sub-bucketed counter
+
+The sub-bucketed counter divides the rolling window into `S` equal slices and maintains a compact ring of counts, giving near-exact accuracy with O(buckets) memory per key.
 
 ### How it works
 
@@ -89,6 +91,8 @@ console.log(limiter.checkSync("k").allowed); // true — rolling estimate has de
 ---
 
 ## slidingWindowLog — exact
+
+The log variant stores the timestamp of every accepted unit and counts only those within the trailing window, giving perfectly accurate rolling-window enforcement with no approximation error.
 
 ### How it works
 

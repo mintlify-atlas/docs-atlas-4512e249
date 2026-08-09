@@ -1,5 +1,5 @@
 ---
-title: "throttlekit/redis — Redis Store"
+title: "throttlekit/redis — Distributed Redis Rate-Limit Store"
 sidebarTitle: "Redis Store"
 description: "Distributed Store backed by Redis. Atomic Lua for built-in strategies, OCC fallback for custom ones, and adapters for ioredis, node-redis, and Upstash."
 ---
@@ -133,6 +133,28 @@ interface RedisClientLike {
   multi(): RedisMultiLike;
   duplicate?(): RedisClientLike;
   disconnect?(): void | Promise<void>;
+}
+```
+
+### `RedisMultiLike`
+
+The subset of a Redis transaction (`MULTI`) used by the optimistic-concurrency fallback.
+
+```ts
+interface RedisMultiLike {
+  set(key: string, value: string, mode: "PX", ttlMs: number): RedisMultiLike;
+  exec(): Promise<Array<[Error | null, unknown]> | null>;
+}
+```
+
+### `NodeRedisMultiLike`
+
+The subset of a node-redis `MULTI` chain ThrottleKit uses.
+
+```ts
+interface NodeRedisMultiLike {
+  set(key: string, value: string, options: { PX: number }): NodeRedisMultiLike;
+  exec(): Promise<unknown[]>;
 }
 ```
 

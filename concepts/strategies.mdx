@@ -1,5 +1,5 @@
 ---
-title: "Rate-Limiting Strategies in ThrottleKit"
+title: "ThrottleKit Rate-Limiting Strategies and Algorithms"
 sidebarTitle: "Strategies"
 description: "Strategies are pure (state, now, cost) functions portable to Redis Lua, proven bit-identical. Covers GCRA, token bucket, sliding window, and how to choose."
 ---
@@ -141,15 +141,18 @@ slidingWindowLog({
 
 **State:** scheduling timestamps. **Memory:** O(1).
 
-A *shaping* variant that **delays** rather than rejects, smoothing output to a fixed drain rate. Useful for outbound rate shaping (e.g., a third-party API budget). `limiter.schedule(key)` resolves when a slot is available, with a `maxQueueMs` ceiling that rejects rather than queuing indefinitely.
+A *shaping* variant that **delays** rather than rejects, smoothing output to a fixed drain rate. Useful for outbound rate shaping (e.g., a third-party API budget). `leakyBucket` returns a `Shaper` — a standalone API with `reserve`, `reserveSync`, and `schedule` methods. `shaper.schedule(key)` resolves after the paced delay, or rejects with `QueueFullError` if the wait would exceed `maxQueueMs`.
 
 ```ts
 import { leakyBucket } from "throttlekit";
 
-leakyBucket({
+const shaper = leakyBucket({
   ratePerSec: 10,
   maxQueueMs: 5_000,
-})
+});
+
+// Resolves after the paced delay; throws QueueFullError if wait > maxQueueMs
+await shaper.schedule("outbound-api-key");
 ```
 
 ### adaptiveConcurrency — backpressure from latency

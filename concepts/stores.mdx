@@ -1,5 +1,5 @@
 ---
-title: "Storage Backends in ThrottleKit"
+title: "ThrottleKit Storage Backends: Memory, Redis, and More"
 sidebarTitle: "Stores"
 description: "Stores expose one atomic apply primitive. Learn MemoryStore, RedisStore, Postgres, DynamoDB, bit-identical conformance across six backends, and fail modes."
 ---
@@ -43,10 +43,13 @@ interface Store {
 ```ts
 import { MemoryStore } from "throttlekit";
 
+// All options are optional
 const store = new MemoryStore({
-  clock?: Clock,            // injectable time source (defaults to systemClock)
-  maxKeys?: number,         // cap key cardinality to bound memory
-  sweepIntervalMs?: number, // background expiry sweep interval (0 to disable)
+  // clock: yourClock,          // injectable time source (defaults to systemClock)
+  // maxKeys: 100_000,          // cap key cardinality; CLOCK eviction when full
+  // sweepIntervalMs: 5_000,    // background expiry sweep interval (0 to disable, default 5000)
+  // tickMs: 1_000,             // timer-wheel tick resolution in ms (default 1000)
+  // wheelSize: 512,            // timer-wheel slot count (default 512)
 });
 ```
 

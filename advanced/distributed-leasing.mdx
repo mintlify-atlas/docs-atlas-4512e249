@@ -1,5 +1,5 @@
 ---
-title: "Distributed Leasing"
+title: "Distributed Token Leasing with the GALE Two-Tier Engine"
 sidebarTitle: "Distributed Leasing"
 description: "GALE's provable two-tier engine: serve token batches locally from a distributed store with a hard, fleet-size-independent overshoot bound."
 ---
@@ -223,7 +223,8 @@ const d = escrow.checkSync("enterprise:alpha", 1_000);
 For multi-region deployments, `federatedWeightedFairEscrow` composes two levels of this primitive: per-region tenant WFE within each region, composed through a shared `regionFairPool` (a WFE over regions) into a global weighted-max-min guarantee. The `RedisRegionFairPool` is the production store-backed cross-region pool.
 
 ```ts
-import { federatedWeightedFairEscrow, RedisRegionFairPool } from "throttlekit";
+import { federatedWeightedFairEscrow } from "throttlekit";
+import { RedisRegionFairPool } from "throttlekit/twotier";
 
 const pool = new RedisRegionFairPool({
   client: redis,
@@ -262,19 +263,27 @@ When an L2 call fails (network error, Redis unavailability), the lease path foll
 When the distributed engine runs behind the ThrottleKit gRPC service rather than a directly-accessible Redis, a client can lease a chunk of the global budget over one RPC and serve requests locally. `LeaseSpender` implements the client-side spend: it is a direct port of the `twoTier(leased, windowCoupled)` L1 path.
 
 ```ts
-import { LeaseSpender } from "throttlekit";
+import { LeaseSpender } from "throttlekit/twotier";
 
 const spender = new LeaseSpender({
-  windowMs: 60_000,
-  // `reserve` calls the gRPC Fleet.Reserve endpoint
-  reserve: async (wants) => grpcClient.reserve({ wants }),
+  limit: 1_000,      // global per-window budget (the strategy's limit)
+  ttlMs: 60_000,     // fallback resetAt when no lease has been applied yet
+  // windowCoupled defaults to true — credits expire when the granting window rolls
 });
 
-const result = spender.spend(now, "tenant-1", 1);
-if (result.type === "allow") {
-  // serve locally
-} else if (result.type === "needs-refresh") {
-  // refill from the server, then retry
+// `reserve` calls the gRPC Fleet.Reserve endpoint
+const reserve = async (wants: number) => grpcClient.reserve({ wants });
+
+// Full client loop: spend locally, refresh from server on shortage
+const decision = await spender.spendOrRefresh(Date.now(), 1, reserve);
+if (!decision.allowed) backOff(decision.retryAfterMs);
+
+// Or use the low-level spend() for custom refresh logic:
+const result = spender.spend(Date.now(), 1);
+if (!result.needsRefresh) {
+  // serve locally using result.decision
+} else {
+  // out of local credits — call reserve() to refill
 }
 ```
 

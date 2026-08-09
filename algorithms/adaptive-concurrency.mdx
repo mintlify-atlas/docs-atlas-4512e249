@@ -1,5 +1,5 @@
 ---
-title: "Adaptive Concurrency"
+title: "Adaptive Concurrency — Latency-Inferred In-Flight Limit"
 sidebarTitle: "Adaptive Concurrency"
 description: "A TCP-congestion-control-style ceiling on in-flight requests, inferred from latency gradient — no guessing the right static limit required."
 ---
@@ -18,7 +18,7 @@ When the caller finishes the request, it calls `lease.release()`. The guard reco
 
 Compares the best-observed ("no-load") RTT to the current RTT. While the ratio stays near 1, the limit grows by `√limit` of headroom. As the current RTT climbs above the no-load baseline, a gradient drives the limit down multiplicatively. An EMA (`smoothing`) prevents oscillation:
 
-```
+```text
 gradient = clamp((tolerance * rttNoload) / rtt, 0.5, 1.0)
 queueSize = sqrt(estimate)
 newLimit = estimate * gradient + queueSize

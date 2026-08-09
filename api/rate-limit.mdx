@@ -1,5 +1,5 @@
 ---
-title: "rateLimit() — Core Limiter Factory"
+title: "rateLimit() — Build a Rate Limiter from a Strategy"
 sidebarTitle: "rateLimit()"
 description: "Build a rate limiter from a strategy and a store. The single entry point for constructing a Limiter from any built-in or custom algorithm."
 ---
@@ -86,34 +86,36 @@ function rateLimit<S = unknown>(options: RateLimitOptions<S>): Limiter
   synchronous store; throws otherwise.
 </ResponseField>
 
-<ResponseField name="peek" type="(key: string) => Promise<Decision> | undefined">
+<ResponseField name="peek" type="(key: string) => Promise<Decision>">
   Non-consuming introspection: returns the current `Decision` for `key` **without spending** any
-  capacity. Useful for building retry/backoff UX. Only present when the strategy implements `peek`.
-  Absent on composite limiters where a non-consuming read isn't well-defined.
+  capacity. Useful for building retry/backoff UX. Optional — only present when the strategy
+  implements `peek`. Absent on composite limiters where a non-consuming read isn't well-defined.
 </ResponseField>
 
-<ResponseField name="peekSync" type="(key: string) => Decision | undefined">
-  Synchronous form of `peek`. Requires both a synchronous store and a strategy that implements `peek`.
+<ResponseField name="peekSync" type="(key: string) => Decision">
+  Synchronous form of `peek`. Optional — requires both a synchronous store and a strategy that
+  implements `peek`.
 </ResponseField>
 
-<ResponseField name="forecast" type="(key: string, cost?: number) => Promise<Forecast> | undefined">
+<ResponseField name="forecast" type="(key: string, cost?: number) => Promise<Forecast>">
   Non-consuming capacity forecast: how many `cost`-sized requests are spendable right now
   (`spendableNow`), when capacity next increases (`nextReplenishAt`), and when it is fully
   replenished (`fullAt`). Optional — present only when the strategy implements `forecast`.
 </ResponseField>
 
-<ResponseField name="forecastSync" type="(key: string, cost?: number) => Forecast | undefined">
-  Synchronous form of `forecast`. Requires a synchronous store and a strategy with `forecast`.
+<ResponseField name="forecastSync" type="(key: string, cost?: number) => Forecast">
+  Synchronous form of `forecast`. Optional — requires a synchronous store and a strategy with
+  `forecast`.
 </ResponseField>
 
 <ResponseField name="reset" type="(key: string) => Promise<void>">
   Forget a key's stored state. The next check for that key starts fresh.
 </ResponseField>
 
-<ResponseField name="close" type="() => Promise<void> | undefined">
-  Release resources owned by this limiter instance. When `rateLimit` created its own default store
-  (`store` was omitted), `close()` shuts it down. When you passed a store, `close()` is a no-op for
-  that store — closing it remains your responsibility.
+<ResponseField name="close" type="() => Promise<void>">
+  Release resources owned by this limiter instance. Optional — when `rateLimit` created its own
+  default store (`store` was omitted), `close()` shuts it down. When you passed a store, `close()`
+  is a no-op for that store — closing it remains your responsibility.
 </ResponseField>
 
 ## The Decision Object

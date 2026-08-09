@@ -1,5 +1,5 @@
 ---
-title: "Edge Stores"
+title: "ThrottleKit Edge Stores — Cloudflare, Deno Rate Limiting"
 sidebarTitle: "Edge Stores"
 description: "Rate limiting on Cloudflare Workers and Deno Deploy — Durable Objects, D1 SQLite, Workers KV, and Deno KV, each with the right atomicity primitive."
 ---
@@ -56,12 +56,12 @@ export class RateLimiter {
   `@cloudflare/workers-types` dependency required.
 </ParamField>
 
-<ParamField path="options.prefix" type="string">
+<ParamField path="prefix" type="string">
   Storage key namespace. Keys are stored as `prefix:key`. Useful when one
   Durable Object instance backs multiple limiters.
 </ParamField>
 
-<ParamField path="options.clock" type="Clock">
+<ParamField path="clock" type="Clock">
   Time source for lazy expiry. Defaults to the system clock. Inject a
   `ManualClock` for deterministic tests.
 </ParamField>

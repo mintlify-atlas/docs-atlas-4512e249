@@ -1,5 +1,5 @@
 ---
-title: "twoTier() — Distributed Limiter with L1/L2"
+title: "twoTier() — Two-Tier Distributed Limiter with L1/L2"
 sidebarTitle: "twoTier()"
 description: "Build a two-tier limiter that fronts a distributed store with a configurable local tier for reduced network cost and bounded global overshoot."
 ---
@@ -128,10 +128,10 @@ Returns a `Limiter` with the same interface as `rateLimit`. Note that `checkSync
 
 ## Helper Functions
 
-### `eoqOptimum(demand, orderCost, strandPenalty)`
+### `eoqOptimum(orderCost, strandPenalty, demand)`
 
 ```ts
-function eoqOptimum(demand: number, orderCost: number, strandPenalty: number): number
+function eoqOptimum(orderCost: number, strandPenalty: number, demand: number): number
 ```
 
 The closed-form Economic Order Quantity optimum: `√(2 · orderCost · demand / strandPenalty)`. The

@@ -1,5 +1,5 @@
 ---
-title: "Unified Admission"
+title: "Unified Admission Control: Rate, Concurrency, Cost"
 sidebarTitle: "Unified Admission"
 description: "Compose rate, concurrency, and token-cost axes into one admit() call, one lease lifecycle, and one binding-axis signal with the TALE engine."
 ---
@@ -155,7 +155,7 @@ If a downstream axis (rate or cost) denies after concurrency was acquired, the s
 `tokenBudget` is the post-hoc cost meter for LLM streaming: debit actual tokens as they are produced, not reserves at admission.
 
 ```ts
-import { tokenBudget } from "throttlekit/admission";
+import { tokenBudget } from "throttlekit";
 
 const meter = tokenBudget({ budget: 100_000, windowMs: 60_000 });
 
@@ -176,7 +176,7 @@ Per-token debiting (`tokens = 1`) achieves **zero overshoot** — the budget sto
 These TALE Layer 2 and 3 primitives learn the per-request token **reservation** that paces admission over a `tokenBudget`, minimizing the asymmetric newsvendor / pinball loss.
 
 ```ts
-import { learnedReservation, tokenBudget } from "throttlekit/admission";
+import { learnedReservation, tokenBudget } from "throttlekit";
 
 const meter  = tokenBudget({ budget: 100_000, windowMs: 60_000 });
 const policy = learnedReservation({
@@ -208,7 +208,7 @@ if (policy.reserve() <= meter.remaining()) {
 Batch allocation of an integer `limit` across tenants with per-tenant `demands` and `weights`. Returns the exact, work-conserving weighted max-min split as an array of integer credits.
 
 ```ts
-import { weightedMaxMin } from "throttlekit/admission";
+import { weightedMaxMin } from "throttlekit";
 
 const credits = weightedMaxMin(
   [800, 400, 200],    // demands
@@ -223,7 +223,7 @@ const credits = weightedMaxMin(
 The streaming, per-arrival face of `weightedMaxMin`: a global fixed-window budget split so each tenant's ceiling is proportional to its weight. Returns a `WeightedFairShareLimiter`.
 
 ```ts
-import { weightedFairShare } from "throttlekit/admission";
+import { weightedFairShare } from "throttlekit";
 
 const limiter = weightedFairShare({
   limit: 1_000,
@@ -245,7 +245,7 @@ p = max(0, (requests − K × accepts) / (requests + 1))
 ```
 
 ```ts
-import { adaptiveThrottle } from "throttlekit/admission";
+import { adaptiveThrottle } from "throttlekit";
 
 const throttle = adaptiveThrottle({ k: 2, windowMs: 10_000 });
 
@@ -316,7 +316,7 @@ import {
   tokenBucket,
   unifiedAdmission,
 } from "throttlekit";
-import { bindingAxisOf } from "throttlekit/observability";
+import { bindingAxisOf } from "throttlekit/otel";
 
 const clock = new ManualClock(0);
 

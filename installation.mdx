@@ -1,5 +1,5 @@
 ---
-title: "Installing ThrottleKit"
+title: "Installing ThrottleKit: npm, Peer Deps, Entry Points"
 sidebarTitle: "Installation"
 description: "Install ThrottleKit via npm, yarn, pnpm, or bun. Covers Node.js requirements, optional peer dependencies, ESM/CJS support, and all 24 subpath entry points."
 ---
@@ -55,7 +55,7 @@ Install peer dependencies only for the backends and frameworks you use. Everythi
 | `pg` | Postgres store | `throttlekit/postgres` |
 | `express` | Express middleware adapter | `throttlekit/express` |
 | `fastify` | Fastify plugin adapter | `throttlekit/fastify` |
-| `@hono/hono` | Hono middleware adapter | `throttlekit/hono` |
+| `hono` | Hono middleware adapter | `throttlekit/hono` |
 | `koa` | Koa middleware adapter | `throttlekit/koa` |
 | `next` | Next.js API route adapter | `throttlekit/next` |
 | `@nestjs/common` | NestJS guard adapter | `throttlekit/nest` |
@@ -108,6 +108,7 @@ ThrottleKit exports **24 subpath entry points**, each tree-shakeable and indepen
 | `throttlekit/twotier` | `twoTier`, `LeaseSpender`, `weightedFairEscrow`, `leaseSizer` |
 | `throttlekit/federation` | `federate`, `GlobalCoordinator`, `RedisCoordinator` |
 | `throttlekit/otel` | OpenTelemetry metrics integration |
+| `throttlekit/config` | `buildStrategy` and config-file loader utilities |
 | `throttlekit/policy` | `plan`, `policySet`, `assertPlanAcceptable` (experimental) |
 | `throttlekit/testkit` | `recordLimiter`, `replay`, `ManualClock` test utilities |
 

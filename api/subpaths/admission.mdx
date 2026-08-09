@@ -1,5 +1,5 @@
 ---
-title: "Admission & Fairness APIs"
+title: "Admission Control and Weighted Fairness API Reference"
 sidebarTitle: "Admission"
 description: "Multi-axis admission, adaptive throttling, weighted fairness, token budgets, learned reservations, decision tap callbacks, and sketch-based rate limiting."
 ---
@@ -113,6 +113,12 @@ try {
 <ResponseField name="bindingAxis" type="UnifiedAxis | undefined">
   The axis whose denial bound this admission (`"rate"` / `"concurrency"` / `"cost"`), or
   `undefined` when admitted or when the joint-LP policy filter denied.
+</ResponseField>
+
+<ResponseField name="policyDenied" type="boolean">
+  `true` when the admission was denied specifically by the joint-LP bid-price filter — every
+  per-axis budget had slack, but `value < p_R + p_C · cost`. Absent or falsy under
+  `policy: "marginal"` or any axis-bound denial.
 </ResponseField>
 
 ---
@@ -240,6 +246,11 @@ async function callBackend() {
   The current local reject probability `p` in `[0, 1]`. Read-only.
 </ResponseField>
 
+<ResponseField name="stats" type="() => { requests: number; accepts: number; rejectProbability: number }">
+  A point-in-time snapshot for metrics and introspection: rolling request and accept counts plus
+  the current reject probability.
+</ResponseField>
+
 ---
 
 ## weightedFairShare
@@ -288,6 +299,72 @@ function weightedMaxMin(
 
 Use this for batch allocation (when you have all demands at once) as opposed to the streaming
 `weightedFairShare`.
+
+---
+
+## fairShare
+
+Equal-share fairness across tenants — an online approximation of max-min fair allocation. One
+global budget of `limit` admissions per epoch-aligned window is split so no single tenant can
+monopolize it.
+
+```ts
+import { fairShare } from "throttlekit";
+
+function fairShare(options: FairShareOptions): FairShareLimiter
+```
+
+<ParamField body="limit" type="number" required>
+  Global admissions budget shared across all tenants per window.
+</ParamField>
+
+<ParamField body="windowMs" type="number" required>
+  Window width in ms. Windows are epoch-aligned: `floor(now/windowMs)*windowMs`.
+</ParamField>
+
+<ParamField body="clock" type="Clock">
+  Injected clock. Defaults to the system clock.
+</ParamField>
+
+<ResponseField name="checkSync" type="(tenant: string, cost?: number) => Decision">
+  Synchronous, zero-`await` check for `tenant` with the given `cost` (default `1`).
+</ResponseField>
+
+<ResponseField name="check" type="(tenant: string, cost?: number) => Promise<Decision>">
+  Promise-returning form of `checkSync`; resolves synchronously.
+</ResponseField>
+
+<ResponseField name="reset" type="(tenant?: string) => void">
+  Reset one tenant's usage (it leaves the active set), or — with no argument — the whole window.
+</ResponseField>
+
+---
+
+## guaranteedShare
+
+Compute the guaranteed weighted share `floor(w_i · limit / W)` for each tenant given their weights
+and a total limit. Returns the static floor a weighted max-min split never drops a backlogged tenant
+below.
+
+```ts
+import { guaranteedShare } from "throttlekit";
+
+function guaranteedShare(weights: readonly number[], limit: number): number[]
+```
+
+---
+
+## criticalFractile
+
+The critical-fractile quantile level `τ = overrunCost / (holdCost + overrunCost)` — the cost
+quantile that minimises the asymmetric newsvendor / pinball loss, and the target
+`learnedReservation` descends onto.
+
+```ts
+import { criticalFractile } from "throttlekit";
+
+function criticalFractile(holdCost: number, overrunCost: number): number
+```
 
 ---
 

@@ -1,5 +1,5 @@
 ---
-title: "Adapters Overview"
+title: "ThrottleKit Adapters: All 13 Framework Integrations"
 sidebarTitle: "Overview"
 description: "ThrottleKit ships 13 framework adapters — thin glue over one enforcement core — all sharing the same options surface and standards headers."
 ---
@@ -81,7 +81,7 @@ All HTTP adapters accept `CommonAdapterOptions`. The most commonly used fields a
 ### `buildRateLimitHeaders()`
 
 ```ts
-import { buildRateLimitHeaders } from "throttlekit/headers";
+import { buildRateLimitHeaders } from "throttlekit";
 
 const headers = buildRateLimitHeaders(decision, {
   emit: { draft: true, legacy: true },
@@ -108,7 +108,7 @@ On a denial (`decision.allowed === false`) a `Retry-After` header (delta-seconds
 For protocols that are not HTTP — message queues, job runners, WebSocket frames, gRPC, or any custom transport — use `createEnforcer` instead of an HTTP adapter. It exposes the same enforcement logic but returns a transport-neutral `EnforceResult` rather than writing a response.
 
 ```ts
-import { createEnforcer } from "throttlekit/enforce";
+import { createEnforcer } from "throttlekit";
 import { gcra } from "throttlekit";
 
 const { enforce } = createEnforcer({
@@ -197,7 +197,7 @@ Pass any key through a one-way hash before storing it in the rate-limit store. A
 ```ts
 import { hashKey } from "throttlekit";
 
-const key = hashKey(rawIp); // SHA-256 hex, truncated to 32 chars
+const key = hashKey(rawIp, process.env.RL_SECRET ?? "dev-secret"); // HMAC-SHA-256, 64-char hex
 ```
 
 ### `hmacKeyer()`

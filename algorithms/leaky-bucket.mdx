@@ -1,5 +1,5 @@
 ---
-title: "Leaky Bucket"
+title: "Leaky Bucket Traffic Shaper — Steady-Rate Scheduling"
 sidebarTitle: "Leaky Bucket"
 description: "Traffic shaping via departure scheduling: paces bursty input to a steady output rate, rejecting only when the queue wait exceeds maxQueueMs."
 ---
@@ -81,6 +81,8 @@ try {
 `QueueFullError.retryAfterMs` is an advisory estimate of how long until the queue drains enough to accept a new reservation.
 
 ## Code examples
+
+The following examples show the three usage patterns for the leaky bucket shaper: inspect-and-sleep with `reserve`, automatic pacing with `schedule`, and deterministic unit testing with `reserveSync`.
 
 ### reserve — inspect the delay, sleep yourself
 

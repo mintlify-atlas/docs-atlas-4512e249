@@ -1,5 +1,5 @@
 ---
-title: "Observability"
+title: "Observability: Decision Taps, Analytics, OpenTelemetry"
 sidebarTitle: "Observability"
 description: "Decision taps, in-process analytics, OpenTelemetry integration, and the ThrottleKit Lens terminal dashboard for full rate-limit visibility."
 ---
@@ -11,7 +11,7 @@ Every ThrottleKit decision is a structured object — observability turns the st
 `tapDecisions` wraps any `Limiter` and fires a callback once per completed check (after the decision resolves). The limiter is returned unchanged and all methods — including optional `peek` / `forecast` / `close` — are forwarded.
 
 ```ts
-import { tapDecisions, type DecisionTap, type DecisionEvent } from "throttlekit/observability";
+import { tapDecisions, type DecisionTap, type DecisionEvent } from "throttlekit";
 
 const limiter = tapDecisions(
   rateLimit({ strategy: gcra({ limit: 100, periodMs: 60_000 }) }),
@@ -59,7 +59,7 @@ A throwing tap can never break the limiter — exceptions are caught and silentl
 `withAnalytics` wraps any limiter and tracks allow/deny counts and top-K heavy hitters in-process, on a fixed epoch-aligned window. No OpenTelemetry backend, no external peer, zero configuration.
 
 ```ts
-import { withAnalytics } from "throttlekit/analytics";
+import { withAnalytics } from "throttlekit";
 import { ManualClock, gcra, rateLimit } from "throttlekit";
 
 const clock = new ManualClock(0);
@@ -188,7 +188,7 @@ const guard   = instrumentGuard(concurrencyGuard, meter);
 `throttlekit.binding_axis` reports, for a denied `unifiedAdmission`, which of the three axes (rate / concurrency / cost) actually bound the decision. This is derived by `bindingAxisOf(lastDecisions())`:
 
 ```ts
-import { bindingAxisOf } from "throttlekit/observability";
+import { bindingAxisOf } from "throttlekit/otel";
 
 const axis = bindingAxisOf(admit.lastDecisions());
 // → "rate" | "concurrency" | "cost" | undefined (on allow or policy-deny)

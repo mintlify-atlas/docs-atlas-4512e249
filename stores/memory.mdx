@@ -1,7 +1,7 @@
 ---
-title: "In-Memory Store"
+title: "ThrottleKit In-Memory Store — Zero-Dep, Single-Process"
 sidebarTitle: "In-Memory"
-description: "Zero-dependency, single-process store with second-chance CLOCK-LRU eviction, O(1) timing-wheel expiry, and a synchronous fast path."
+description: "Zero-dependency, single-process store with second-chance CLOCK-LRU eviction, O(1) timing-wheel expiry, and a synchronous fast path for Node.js."
 ---
 
 `MemoryStore` is the default backend that ships inside ThrottleKit's core package — no installation step, no peer dependencies, no network. All state lives in a plain JavaScript `Map`, and because Node.js is single-threaded, a synchronous read-modify-write cannot interleave: `applySync` needs no locks and pays zero coordination overhead. The async `apply` simply resolves the same result, so every algorithm works identically on both the sync and async code paths.

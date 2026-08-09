@@ -1,5 +1,5 @@
 ---
-title: "Fixed Window"
+title: "Fixed Window Rate Limiter — Epoch-Aligned Counters"
 sidebarTitle: "Fixed Window"
 description: "The cheapest rate-limiting counter: requests are tallied in epoch-aligned windows of fixed width and reset hard at every window boundary."
 ---
@@ -22,7 +22,7 @@ Fixed window is the cheapest possible counter: O(1) memory per key, trivially ch
 
 Because windows reset on hard boundaries, a client can exhaust the full `limit` at the very end of one window and then immediately exhaust the full `limit` again at the start of the next. This means up to **2×limit requests can be admitted across a single window boundary**.
 
-```
+```text
 window N     |-------- limit ------->| boundary
 window N+1   |<-------- limit --------| ...
               ↑ up to 2×limit in a short span
@@ -98,5 +98,5 @@ A stale `start` (from a previous window) is treated as a count of zero, so the c
 - **Low-memory requirements** — when you need to rate-limit millions of keys with minimal per-key storage.
 
 <Tip>
-  Fixed window is the cheapest strategy. If boundary bursts matter, reach for [sliding window](/algorithms/sliding-window) (bounded memory, near-exact) or [GCRA](/algorithms/gcra) (smooth pacing). If the limit is low and you need exact accuracy, use [sliding window log](/algorithms/sliding-window#sliding-window-log-exact).
+  Fixed window is the cheapest strategy. If boundary bursts matter, reach for [sliding window](/algorithms/sliding-window) (bounded memory, near-exact) or [GCRA](/algorithms/gcra) (smooth pacing). If the limit is low and you need exact accuracy, use [sliding window log](/algorithms/sliding-window#slidingwindowlog--exact).
 </Tip>

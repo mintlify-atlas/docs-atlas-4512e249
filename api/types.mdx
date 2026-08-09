@@ -1,5 +1,5 @@
 ---
-title: "Core Types and Interfaces"
+title: "ThrottleKit Core Types and Interfaces API Reference"
 sidebarTitle: "Types"
 description: "Complete reference for every type and interface in ThrottleKit: Decision, Strategy, Store, Limiter, Clock, errors, combineDecisions, and security helpers."
 ---
@@ -313,6 +313,23 @@ if (!d.allowed) throw new RateLimitExceededError(d);
 ### NotImplementedError
 
 Thrown by placeholder code paths that are declared but not yet implemented. Code: `"not_implemented"`.
+
+### QueueFullError
+
+Thrown by `leakyBucket` when the shaper's internal queue is at capacity and cannot accept another
+reservation. Code: `"queue_full"`. Carries `retryAfterMs`.
+
+```ts
+import { QueueFullError } from "throttlekit";
+
+try {
+  await shaper.reserve(1);
+} catch (err) {
+  if (err instanceof QueueFullError) {
+    // The leaky-bucket queue is full — shed or retry after err.retryAfterMs
+  }
+}
+```
 
 ## combineDecisions
 
